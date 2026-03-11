@@ -1,10 +1,21 @@
 import imageio, os, torch, warnings, torchvision, argparse, json
+from datetime import timedelta
+from numbers import Number
+import time
 from peft import LoraConfig, inject_adapter_in_model
 from PIL import Image
 import pandas as pd
 from tqdm import tqdm
 from accelerate import Accelerator
 from accelerate.utils import DistributedDataParallelKwargs
+try:
+    from accelerate.utils import InitProcessGroupKwargs
+except ImportError:
+    InitProcessGroupKwargs = None
+try:
+    from torch.utils.tensorboard import SummaryWriter
+except ImportError:
+    SummaryWriter = None
 
 
 
@@ -134,8 +145,7 @@ class ImageDataset(torch.utils.data.Dataset):
                     path = os.path.join(self.base_path, data[key])
                     data[key] = self.load_data(path)
                 if data[key] is None:
-                    warnings.warn(f"cannot load file {data[key]}.")
-                    return None
+                    raise RuntimeError(f"cannot load file for key='{key}', path='{path}'.")
         return data
     
 
@@ -306,8 +316,7 @@ class VideoDataset(torch.utils.data.Dataset):
                 path = os.path.join(self.base_path, data[key])
                 data[key] = self.load_data(path)
                 if data[key] is None:
-                    warnings.warn(f"cannot load file {data[key]}.")
-                    return None
+                    raise RuntimeError(f"cannot load file for key='{key}', path='{path}'.")
         return data
     
 
@@ -397,8 +406,7 @@ class ModelLogger:
 
 
     def on_training_end(self, accelerator, model, save_steps=None):
-        if save_steps is not None and self.num_steps % save_steps != 0:
-            self.save_model(accelerator, model, f"step-{self.num_steps}.safetensors")
+        self.save_model(accelerator, model, "final.safetensors")
 
 
     def save_model(self, accelerator, model, file_name):
@@ -423,16 +431,70 @@ def launch_training_task(
     num_epochs: int = 1,
     gradient_accumulation_steps: int = 1,
     find_unused_parameters: bool = False,
+    ddp_timeout_seconds: int = 3600,
+    tensorboard_dir: str = None,
+    tensorboard_log_steps: int = 10,
+    heartbeat_log_steps: int = 1,
 ):
-    dataloader = torch.utils.data.DataLoader(dataset, shuffle=True, collate_fn=lambda x: x[0], num_workers=num_workers)
+    if len(dataset) == 0:
+        raise ValueError("Dataset is empty. Please verify metadata and dataset paths.")
+    dataloader = torch.utils.data.DataLoader(
+        dataset,
+        shuffle=True,
+        collate_fn=lambda x: x[0],
+        num_workers=num_workers,
+        drop_last=True,
+        pin_memory=torch.cuda.is_available(),
+        persistent_workers=(num_workers > 0),
+    )
+    kwargs_handlers = [DistributedDataParallelKwargs(find_unused_parameters=find_unused_parameters)]
+    if InitProcessGroupKwargs is not None:
+        kwargs_handlers.append(
+            InitProcessGroupKwargs(timeout=timedelta(seconds=max(int(ddp_timeout_seconds), 1)))
+        )
     accelerator = Accelerator(
         gradient_accumulation_steps=gradient_accumulation_steps,
-        kwargs_handlers=[DistributedDataParallelKwargs(find_unused_parameters=find_unused_parameters)],
+        kwargs_handlers=kwargs_handlers,
     )
     model, optimizer, dataloader, scheduler = accelerator.prepare(model, optimizer, dataloader, scheduler)
+    unwrapped_model = accelerator.unwrap_model(model)
+    writer = None
+    if accelerator.is_main_process and tensorboard_dir:
+        if SummaryWriter is None:
+            warnings.warn("tensorboard is not installed. Skip TensorBoard logging.")
+        else:
+            os.makedirs(tensorboard_dir, exist_ok=True)
+            writer = SummaryWriter(log_dir=tensorboard_dir)
+
+    if accelerator.num_processes > 1:
+        local_num_batches = torch.tensor([len(dataloader)], device=accelerator.device, dtype=torch.long)
+        gathered_num_batches = accelerator.gather(local_num_batches)
+        if not torch.all(gathered_num_batches == gathered_num_batches[0]):
+            raise RuntimeError(
+                f"Inconsistent dataloader lengths across ranks: {gathered_num_batches.tolist()}"
+            )
     
+    heartbeat_interval = max(int(heartbeat_log_steps), 1)
+    last_step_end_time = time.perf_counter()
+
     for epoch_id in range(num_epochs):
-        for data in tqdm(dataloader):
+        progress_bar = tqdm(dataloader, disable=not accelerator.is_local_main_process)
+        for step_id, data in enumerate(progress_bar, start=1):
+            step_ready_time = time.perf_counter()
+            data_wait_s = step_ready_time - last_step_end_time
+            if data is None:
+                raise RuntimeError(
+                    f"Received empty batch at epoch={epoch_id}, step={step_id}. "
+                    "Check dataset loading and metadata consistency."
+                )
+            step_compute_start = time.perf_counter()
+            if accelerator.is_main_process and model_logger.num_steps % heartbeat_interval == 0:
+                print(
+                    f"[rank0][step-start] epoch={epoch_id + 1}/{num_epochs} "
+                    f"iter={step_id}/{len(dataloader)} global_step={model_logger.num_steps} "
+                    f"data_wait_s={data_wait_s:.3f}",
+                    flush=True,
+                )
             with accelerator.accumulate(model):
                 optimizer.zero_grad()
                 loss = model(data)
@@ -440,9 +502,52 @@ def launch_training_task(
                 optimizer.step()
                 model_logger.on_step_end(accelerator, model, save_steps)
                 scheduler.step()
+                loss_value = float(loss.detach().item())
+                if writer is not None and model_logger.num_steps % max(int(tensorboard_log_steps), 1) == 0:
+                    global_step = model_logger.num_steps
+                    writer.add_scalar("train/loss", loss_value, global_step)
+                    if len(optimizer.param_groups) > 0:
+                        writer.add_scalar("train/lr", float(optimizer.param_groups[0]["lr"]), global_step)
+                    metrics = getattr(unwrapped_model, "_last_metrics", None)
+                    if isinstance(metrics, dict):
+                        for metric_name, metric_value in metrics.items():
+                            if isinstance(metric_value, torch.Tensor):
+                                if metric_value.numel() != 1:
+                                    continue
+                                metric_value = float(metric_value.detach().item())
+                            elif isinstance(metric_value, bool):
+                                metric_value = float(metric_value)
+                            elif isinstance(metric_value, Number):
+                                metric_value = float(metric_value)
+                            else:
+                                continue
+                            writer.add_scalar(f"train/{metric_name}", metric_value, global_step)
+                if accelerator.is_main_process and model_logger.num_steps % heartbeat_interval == 0:
+                    lr_value = float(optimizer.param_groups[0]["lr"]) if len(optimizer.param_groups) > 0 else 0.0
+                    step_s = time.perf_counter() - step_compute_start
+                    print(
+                        f"[rank0][heartbeat] epoch={epoch_id + 1}/{num_epochs} "
+                        f"iter={step_id}/{len(dataloader)} global_step={model_logger.num_steps} "
+                        f"loss={loss_value:.6f} lr={lr_value:.6e} "
+                        f"data_wait_s={data_wait_s:.3f} step_s={step_s:.3f}",
+                        flush=True,
+                    )
+                    if accelerator.is_local_main_process:
+                        progress_bar.set_postfix(
+                            {
+                                "loss": f"{loss_value:.4f}",
+                                "lr": f"{lr_value:.2e}",
+                                "step_s": f"{step_s:.2f}",
+                            }
+                        )
+            last_step_end_time = time.perf_counter()
         if save_steps is None:
             model_logger.on_epoch_end(accelerator, model, epoch_id)
+        if writer is not None:
+            writer.flush()
     model_logger.on_training_end(accelerator, model, save_steps)
+    if writer is not None:
+        writer.close()
 
 
 def launch_data_process_task(model: DiffusionTrainingModule, dataset, output_path="./models"):
@@ -487,6 +592,10 @@ def wan_parser():
     parser.add_argument("--find_unused_parameters", default=False, action="store_true", help="Whether to find unused parameters in DDP.")
     parser.add_argument("--save_steps", type=int, default=None, help="Number of checkpoint saving invervals. If None, checkpoints will be saved every epoch.")
     parser.add_argument("--dataset_num_workers", type=int, default=0, help="Number of workers for data loading.")
+    parser.add_argument("--ddp_timeout_seconds", type=int, default=3600, help="DDP process group timeout in seconds.")
+    parser.add_argument("--tensorboard_dir", type=str, default=None, help="TensorBoard log directory. If None, TensorBoard logging is disabled.")
+    parser.add_argument("--tensorboard_log_steps", type=int, default=10, help="Log TensorBoard metrics every N optimizer steps.")
+    parser.add_argument("--heartbeat_log_steps", type=int, default=1, help="Print rank0 heartbeat every N steps.")
     parser.add_argument("--weight_decay", type=float, default=0.01, help="Weight decay.")
     return parser
 
@@ -520,6 +629,10 @@ def flux_parser():
     parser.add_argument("--find_unused_parameters", default=False, action="store_true", help="Whether to find unused parameters in DDP.")
     parser.add_argument("--save_steps", type=int, default=None, help="Number of checkpoint saving invervals. If None, checkpoints will be saved every epoch.")
     parser.add_argument("--dataset_num_workers", type=int, default=0, help="Number of workers for data loading.")
+    parser.add_argument("--ddp_timeout_seconds", type=int, default=3600, help="DDP process group timeout in seconds.")
+    parser.add_argument("--tensorboard_dir", type=str, default=None, help="TensorBoard log directory. If None, TensorBoard logging is disabled.")
+    parser.add_argument("--tensorboard_log_steps", type=int, default=10, help="Log TensorBoard metrics every N optimizer steps.")
+    parser.add_argument("--heartbeat_log_steps", type=int, default=1, help="Print rank0 heartbeat every N steps.")
     parser.add_argument("--weight_decay", type=float, default=0.01, help="Weight decay.")
     return parser
 
@@ -553,6 +666,10 @@ def qwen_image_parser():
     parser.add_argument("--find_unused_parameters", default=False, action="store_true", help="Whether to find unused parameters in DDP.")
     parser.add_argument("--save_steps", type=int, default=None, help="Number of checkpoint saving invervals. If None, checkpoints will be saved every epoch.")
     parser.add_argument("--dataset_num_workers", type=int, default=0, help="Number of workers for data loading.")
+    parser.add_argument("--ddp_timeout_seconds", type=int, default=3600, help="DDP process group timeout in seconds.")
+    parser.add_argument("--tensorboard_dir", type=str, default=None, help="TensorBoard log directory. If None, TensorBoard logging is disabled.")
+    parser.add_argument("--tensorboard_log_steps", type=int, default=10, help="Log TensorBoard metrics every N optimizer steps.")
+    parser.add_argument("--heartbeat_log_steps", type=int, default=1, help="Print rank0 heartbeat every N steps.")
     parser.add_argument("--weight_decay", type=float, default=0.01, help="Weight decay.")
     parser.add_argument("--processor_path", type=str, default=None, help="Path to the processor. If provided, the processor will be used for image editing.")
     return parser
