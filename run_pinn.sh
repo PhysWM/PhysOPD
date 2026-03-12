@@ -11,7 +11,7 @@ set -euo pipefail
 # You can pass raw fields directly; script will auto-encode to adapter metadata.
 
 python examples/wanvideo/pinn_inference/inference_pinn.py \
-    --prompt "A volleyball fall onto the ground." \
+    --prompt "A volleyball falls into the lake." \
     --checkpoint_path models/train/pinn_plugin_low_noise/pinn_plugin_final.pt \
     --metadata_json '{
       "label":"liquid motion",
@@ -24,7 +24,7 @@ python examples/wanvideo/pinn_inference/inference_pinn.py \
       "q3":"no",
       "q4":"reflection and refraction"
     }' \
-    --output video_pinn_with_raw_metadata5.mp4
+    --output video_pinn_with_raw_metadata6.mp4
 
 # python examples/wanvideo/pinn_inference/inference_pinn.py \
 #   --prompt "Three tennis balls fall onto the ground." \

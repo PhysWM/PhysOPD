@@ -284,24 +284,26 @@ def inference_pinn(
     else:
         print("\n[2/4] No PINN plugin provided, using original model")
     
-    # 3. 识别材质
-    material_type = pipe.material_classifier.classify(prompt)
-    print(f"[3/4] Detected material type: {material_type}")
-    
-    # 4. 生成视频（同时实时追踪每步的物理场 PDE 残差）
-    print(f"\n[4/4] Generating video with real-time physics tracking...")
-    print(f"  Prompt: {prompt}")
-    print(f"  Resolution: {height}x{width}, Frames: {num_frames}")
-    print(f"  Steps: {num_inference_steps}, CFG Scale: {cfg_scale}")
-    
-    pipe.reset_tracking()
-    
+    # 3. 加载元数据（包含 phenomenon label 用于 MoE 路由）
     pinn_metadata, metadata_mode = load_inference_metadata(
         metadata_json=metadata_json,
         metadata_csv=metadata_csv,
     )
     if pinn_metadata is not None:
-        print(f"  Using PINN metadata for MoE routing (mode={metadata_mode}).")
+        print(f"[3/4] Using PINN metadata for MoE routing (mode={metadata_mode}).")
+        phenomenon = pinn_metadata.get("label_name", "liquid motion")
+    else:
+        print(f"[3/4] No PINN metadata provided, using default phenomenon")
+        phenomenon = "liquid motion"
+
+    # 4. 生成视频（同时实时追踪每步的物理场 PDE 残差）
+    print(f"\n[4/4] Generating video with real-time physics tracking...")
+    print(f"  Prompt: {prompt}")
+    print(f"  Phenomenon: {phenomenon}")
+    print(f"  Resolution: {height}x{width}, Frames: {num_frames}")
+    print(f"  Steps: {num_inference_steps}, CFG Scale: {cfg_scale}")
+
+    pipe.reset_tracking()
 
     video = pipe(
         prompt=prompt,

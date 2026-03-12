@@ -19,16 +19,16 @@ class PhysicsAdapter(nn.Module):
         self,
         latent_dim=16,
         hidden_dim=64,
-        material_types=4,
         num_phenomena=17,
         n_numeric_dim=12,
         q_input_dim=64,
         n_text_vocab_size=2048,
         shared_expert_weight=0.3,
         moe_top_k=4,
+        pde_residuals=None,
     ):
         super().__init__()
-        
+
         self.latent_dim = latent_dim
         self.hidden_dim = hidden_dim
         self.num_phenomena = num_phenomena
@@ -42,10 +42,10 @@ class PhysicsAdapter(nn.Module):
         self.use_moe = True
         self.label_only_mode = False
         self.lightweight_cache = False
-        
-        # 兼容旧 checkpoint 保留 material embedding 参数（metadata-only 路径不再使用）
-        self.material_embedding = nn.Embedding(material_types, hidden_dim)
-        
+        self.pde_residuals = pde_residuals  # Reference to PDE residuals module
+        self.apply_constraints_in_forward = True  # Enable constraint application
+        self.constraint_step_size = 0.01  # Small step size for constraint enforcement
+
         # 物理特征提取器（轻量级）
         self.physics_encoder = nn.Sequential(
             nn.Conv3d(latent_dim, hidden_dim, kernel_size=3, padding=1),
@@ -129,16 +129,6 @@ class PhysicsAdapter(nn.Module):
         # 缓存最近一次 forward 的中间结果，供外部可视化使用
         self._cache = {}
 
-    def _build_material_ids(self, material_id, batch_size, device):
-        if isinstance(material_id, torch.Tensor):
-            mat_ids = material_id.to(device=device, dtype=torch.long).view(-1)
-            if mat_ids.numel() == 1:
-                mat_ids = mat_ids.repeat(batch_size)
-            elif mat_ids.numel() != batch_size:
-                mat_ids = mat_ids[:1].repeat(batch_size)
-            return mat_ids
-        return torch.full((batch_size,), int(material_id), device=device, dtype=torch.long)
-
     def _route_label_ids(self, metadata, batch_size, device):
         if not isinstance(metadata, dict) or "label_id" not in metadata:
             return torch.zeros(batch_size, device=device, dtype=torch.long)
@@ -210,22 +200,18 @@ class PhysicsAdapter(nn.Module):
         dominant_expert = topk_indices[:, 0]
         return route_logits, topk_indices, topk_weights, dominant_expert, label_ids
     
-    def forward(self, v_original, z_t, metadata=None, material_id=None):
+    def forward(self, v_original, z_t, metadata=None):
         """
+        Forward pass: Apply physics-informed corrections via MoE expert routing.
+
         Args:
             v_original: 原始模型预测的速度场 [B, C, T, H, W]
             z_t: 当前的latent [B, C, T, H, W]
-            metadata: 条件输入字典（label/n/q）
-            material_id: deprecated，仅保留兼容旧调用
-        
+            metadata: 条件输入字典（label_id/label_name/n/q）
+
         Returns:
             v_corrected: 物理校正后的速度场 [B, C, T, H, W]
         """
-        # 兼容旧调用：forward(v_original, z_t, material_id)
-        if material_id is None and metadata is not None and not isinstance(metadata, dict):
-            material_id = metadata
-            metadata = None
-
         B = v_original.shape[0]
         
         physics_feat = self.physics_encoder(z_t)  # [B, hidden_dim, T, H, W]
@@ -286,11 +272,18 @@ class PhysicsAdapter(nn.Module):
         branch_raw_corrections = torch.zeros(
             B,
             topk_indices.shape[1],
+            self.latent_dim,
+            *v_original.shape[2:],
+            device=v_original.device,
+            dtype=v_original.dtype,
+        )
+        branch_v_corrected = torch.zeros(
+            B,
+            topk_indices.shape[1],
             *v_original.shape[1:],
             device=v_original.device,
             dtype=v_original.dtype,
         )
-        branch_v_corrected = torch.zeros_like(branch_raw_corrections)
         for i in range(B):
             routed_feat = torch.zeros_like(physics_feat[i:i + 1])
             for j in range(topk_indices.shape[1]):
@@ -348,8 +341,17 @@ class PhysicsAdapter(nn.Module):
             "dominant_expert": dominant_expert.detach(),
             "route_logits": route_logits.detach(),
         }
-        
+
         return v_corrected
+
+    def set_pde_residuals(self, pde_residuals):
+        """设置PDE残差模块（用于约束计算）"""
+        self.pde_residuals = pde_residuals
+
+    def set_constraint_mode(self, enabled=True, step_size=0.01):
+        """设置物理约束应用模式"""
+        self.apply_constraints_in_forward = bool(enabled)
+        self.constraint_step_size = max(float(step_size), 0.0)
 
     def set_ablation_modes(self, use_moe=True, label_only_mode=False):
         """设置消融模式开关"""
@@ -380,27 +382,3 @@ class PhysicsAdapter(nn.Module):
             "expert_balance": expert_balance,
             "condition_consistency": condition_consistency,
         }
-
-
-class MaterialIDMapper:
-    """材质类型到ID的映射"""
-    
-    MATERIAL_TO_ID = {
-        'fluid': 0,
-        'rigid': 1,
-        'elastic': 2,
-        'particle': 3,
-        'mixed': 0,  # 默认用fluid
-    }
-    
-    @staticmethod
-    def get_id(material_type):
-        """获取材质ID"""
-        return MaterialIDMapper.MATERIAL_TO_ID.get(material_type, 0)
-    
-    @staticmethod
-    def get_batch_ids(material_types):
-        """批量获取材质ID"""
-        return torch.tensor([
-            MaterialIDMapper.get_id(mat) for mat in material_types
-        ])

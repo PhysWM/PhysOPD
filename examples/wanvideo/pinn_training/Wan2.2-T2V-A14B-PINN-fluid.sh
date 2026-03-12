@@ -24,6 +24,5 @@ accelerate launch \
   --min_timestep_boundary 0 \
   --physics_weight 0.1 \
   --physics_warmup_steps 500 \
-  --material_type fluid \
   --adapter_hidden_dim 64 \
   --find_unused_parameters

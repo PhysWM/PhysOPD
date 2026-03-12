@@ -58,25 +58,6 @@ PHENOMENON_ALIAS = {
     "interference_and_diffraction": "interference and diffraction",
     "unnatural_light_source": "unnatural light source",
 }
-PHENOMENON_TO_MATERIAL = {
-    "rigid body motion": "rigid",
-    "collision": "rigid",
-    "liquid motion": "fluid",
-    "gas motion": "fluid",
-    "elastic motion": "elastic",
-    "deformation": "elastic",
-    "melting": "particle",
-    "solidification": "particle",
-    "vaporization": "fluid",
-    "liquefaction": "fluid",
-    "combustion": "fluid",
-    "explosion": "particle",
-    "reflection": "rigid",
-    "refraction": "fluid",
-    "scattering": "particle",
-    "interference and diffraction": "rigid",
-    "unnatural light source": "fluid",
-}
 PHENOMENON_TO_RESIDUAL_METHOD = {
     "rigid body motion": "rigid_body_motion_residual",
     "collision": "collision_residual",
@@ -125,7 +106,6 @@ class WanPINNTrainingModule(DiffusionTrainingModule):
         physics_weight=0.1,
         physics_warmup_steps=500,
         conditioned_physics_warmup_steps=1000,
-        material_type="auto",
         adapter_hidden_dim=64,
         pinn_checkpoint=None,
         expert_balance_weight=1e-3,
@@ -194,9 +174,9 @@ class WanPINNTrainingModule(DiffusionTrainingModule):
         self.physics_adapter = PhysicsAdapter(
             latent_dim=latent_dim,
             hidden_dim=adapter_hidden_dim,
-            material_types=4,
             num_phenomena=len(PHENOMENON_LABELS),
             moe_top_k=moe_top_k,
+            pde_residuals=None,  # 稍后设置，因为还需要创建 pde_residuals
         )
         self.physics_adapter.train()
         self.physics_adapter.requires_grad_(True)
@@ -209,10 +189,7 @@ class WanPINNTrainingModule(DiffusionTrainingModule):
         )
         self.pde_residuals.train()
         self.pde_residuals.requires_grad_(True)
-        
-        # 材质分类器（不需要训练）
-        self.material_classifier = MaterialClassifier()
-        
+
         # 加载 PINN checkpoint（如果有）
         if pinn_checkpoint is not None:
             checkpoint = torch.load(pinn_checkpoint, map_location="cpu")
@@ -275,7 +252,6 @@ class WanPINNTrainingModule(DiffusionTrainingModule):
         self.physics_weight = physics_weight
         self.physics_warmup_steps = physics_warmup_steps
         self.conditioned_physics_warmup_steps = conditioned_physics_warmup_steps
-        self.material_type = material_type
         self.expert_balance_weight = expert_balance_weight
         self.condition_consistency_weight = condition_consistency_weight
         self.moe_top_k = moe_top_k
@@ -520,20 +496,18 @@ class WanPINNTrainingModule(DiffusionTrainingModule):
             "motion_mask_sparsity": float((1.0 - active.mean()).item()),
         }
 
-    def compute_physics_loss(self, v_pred, z_t, material_type, metadata=None):
-        """计算 PDE 残差损失"""
+    def compute_physics_loss(self, v_pred, z_t, label_name, metadata=None):
+        """计算 PDE 残差损失 - 使用现象直接路由"""
         pde_metadata = None if self.ablate_disable_conditioned_pde else metadata
-        phenomenon_name = ""
-        if isinstance(metadata, dict):
-            phenomenon_name = self._safe_text(metadata.get("label_name", "")).lower()
+        phenomenon_name = label_name.lower() if isinstance(label_name, str) else ""
         residual_method_name = PHENOMENON_TO_RESIDUAL_METHOD.get(phenomenon_name)
         if residual_method_name is not None:
             residual_method = getattr(self.pde_residuals, residual_method_name)
             loss, info = residual_method(z_t, v_pred, metadata=pde_metadata)
         else:
-            loss, info = self.pde_residuals._fallback_material_residual(
-                material_type, z_t, v_pred, metadata=pde_metadata
-            )
+            # If phenomenon not found, use a default (e.g., liquid motion)
+            default_residual = getattr(self.pde_residuals, "liquid_motion_residual")
+            loss, info = default_residual(z_t, v_pred, metadata=pde_metadata)
 
         info = dict(info)
         info.update(self._motion_mask_stats_from_metadata(pde_metadata))
@@ -557,7 +531,7 @@ class WanPINNTrainingModule(DiffusionTrainingModule):
             )
         if phenomenon_name:
             info["phenomenon_name"] = phenomenon_name
-        info["base_material"] = material_type
+        info["phenomenon"] = phenomenon_name  # Store the phenomenon label
         return loss, info
 
     def _metadata_for_sample_and_expert(self, metadata, sample_idx, phenomenon_name, device, dtype):
@@ -999,6 +973,10 @@ class WanPINNTrainingModule(DiffusionTrainingModule):
         metadata["motion_mask"] = motion_mask
         metadata["motion_mask_source"] = "self_supervised"
         motion_mask_metrics = self._collect_motion_mask_metrics(motion_mask)
+
+        # Extract phenomenon label for logging
+        phenomenon = metadata.get("label_name", "liquid motion") if isinstance(metadata, dict) else "liquid motion"
+
         adapter_metadata = metadata
         if self.ablate_disable_moe:
             adapter_metadata = None
@@ -1008,15 +986,6 @@ class WanPINNTrainingModule(DiffusionTrainingModule):
         # ============================================================
         # 2. PhysicsAdapter 施加物理校正（trainable, has grad）
         # ============================================================
-        prompt = data.get("prompt", "") if isinstance(data, dict) else ""
-        if self.material_type == "auto":
-            label_name = metadata.get("label_name", "") if isinstance(metadata, dict) else ""
-            material_type = PHENOMENON_TO_MATERIAL.get(
-                label_name, self.material_classifier.classify(prompt)
-            )
-        else:
-            material_type = self.material_type
-        
         v_corrected = self.physics_adapter(v_original, z_t, metadata=adapter_metadata)
         
         # ============================================================
@@ -1046,8 +1015,10 @@ class WanPINNTrainingModule(DiffusionTrainingModule):
                 collect_diagnostics=collect_diagnostics,
             )
         else:
+            # Get phenomenon label from metadata
+            label_name = metadata.get("label_name", "liquid motion") if isinstance(metadata, dict) else "liquid motion"
             loss_physics, physics_info = self.compute_physics_loss(
-                v_corrected, z_t, material_type, metadata=pde_metadata
+                v_corrected, z_t, label_name, metadata=pde_metadata
             )
         cond_alpha = self.get_conditioned_alpha()
         parse_ratio = 1.0
@@ -1093,7 +1064,7 @@ class WanPINNTrainingModule(DiffusionTrainingModule):
                 v_corrected=v_corrected
             )
         self._last_metrics = {
-            "material_type": material_type,
+            "phenomenon": phenomenon,
             "ablate_disable_moe": self.ablate_disable_moe,
             "ablate_disable_conditioned_pde": self.ablate_disable_conditioned_pde,
             "ablate_disable_aux_losses": self.ablate_disable_aux_losses,
@@ -1157,7 +1128,6 @@ class PINNModelLogger(ModelLogger):
                 'config': {
                     'checkpoint_format_version': 2,
                     'physics_weight': unwrapped_model.physics_weight if hasattr(unwrapped_model, 'physics_weight') else None,
-                    'material_type': unwrapped_model.material_type if hasattr(unwrapped_model, 'material_type') else None,
                     'conditioned_physics_warmup_steps': (
                         unwrapped_model.conditioned_physics_warmup_steps
                         if hasattr(unwrapped_model, 'conditioned_physics_warmup_steps') else None
@@ -1234,11 +1204,6 @@ def pinn_parser():
     parser.add_argument(
         "--conditioned_physics_warmup_steps", type=int, default=1000,
         help="Warmup steps for metadata-conditioned constraints (default: 1000)"
-    )
-    parser.add_argument(
-        "--material_type", type=str, default="auto",
-        choices=["auto", "fluid", "rigid", "elastic", "particle", "mixed"],
-        help="Material type for physics constraints (default: auto)"
     )
     parser.add_argument(
         "--adapter_hidden_dim", type=int, default=64,
@@ -1338,7 +1303,6 @@ if __name__ == "__main__":
         physics_weight=args.physics_weight,
         physics_warmup_steps=args.physics_warmup_steps,
         conditioned_physics_warmup_steps=args.conditioned_physics_warmup_steps,
-        material_type=args.material_type,
         adapter_hidden_dim=args.adapter_hidden_dim,
         pinn_checkpoint=args.pinn_checkpoint,
         expert_balance_weight=args.expert_balance_weight,

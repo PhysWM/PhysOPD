@@ -96,7 +96,6 @@ accelerate launch \
   --min_timestep_boundary 0.417 \
   --physics_weight 0.1 \
   --physics_warmup_steps 500 \
-  --material_type auto \
   --adapter_hidden_dim 64 \
   --moe_top_k "${MOE_TOP_K}" \
   ${MOE_FAST_MODE_FLAG} \
@@ -131,7 +130,6 @@ accelerate launch \
 #   --min_timestep_boundary 0 \
 #   --physics_weight 0.1 \
 #   --physics_warmup_steps 500 \
-#   --material_type auto \
 #   --adapter_hidden_dim 64 \
 #   --moe_top_k "${MOE_TOP_K}" \
 #   ${MOE_FAST_MODE_FLAG} \
@@ -158,7 +156,7 @@ accelerate launch \
 #   --output_path "./models/train/pinn_plugin_ablation_baseline" \
 #   --max_timestep_boundary 0.417 --min_timestep_boundary 0 \
 #   --physics_weight 0.1 --physics_warmup_steps 500 \
-#   --material_type auto --adapter_hidden_dim 64 --find_unused_parameters
+#   --adapter_hidden_dim 64 --find_unused_parameters
 #
 # No-MoE:
 # ... (same args as baseline) ... \

@@ -1177,8 +1177,7 @@ class PhysicsInformedWanVideoPipeline(WanVideoPipeline):
         if self.physics_adapter is None:
             self.physics_adapter = PhysicsAdapter(
                 latent_dim=latent_dim,
-                hidden_dim=64,
-                material_types=4
+                hidden_dim=64
             ).to(self.device)
             print(f"✓ Physics Adapter initialized (latent_dim={latent_dim})")
         return self.physics_adapter
