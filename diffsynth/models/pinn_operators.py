@@ -5,6 +5,7 @@ Physics-Informed Neural Network Operators
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import math
 
 
 class DifferentialOperators:
@@ -22,57 +23,67 @@ class DifferentialOperators:
         """
         计算散度近似 ∇·v (有限差分)
         将 v 的 C 通道视为多个分量，分别在 H 和 W 方向做偏导后求和。
-        
+
         Args:
             v: [B, C, T, H, W]
         Returns:
             div: [B, 1, T, H, W]
         """
+        # Clamp input to prevent overflow
+        v = torch.clamp(v, min=-10.0, max=10.0)
+
         components = []
-        
+
         # dv/dH：沿 H 方向的偏导，所有通道求平均
         # [B, C, T, H-1, W] -> pad -> [B, C, T, H, W] -> mean over C
         dv_dh = v[:, :, :, 1:, :] - v[:, :, :, :-1, :]
         dv_dh = F.pad(dv_dh, (0, 0, 0, 1))  # pad H 方向最后一行
         components.append(dv_dh.mean(dim=1, keepdim=True))
-        
+
         # dv/dW：沿 W 方向的偏导
         dv_dw = v[:, :, :, :, 1:] - v[:, :, :, :, :-1]
         dv_dw = F.pad(dv_dw, (0, 1))  # pad W 方向最后一列
         components.append(dv_dw.mean(dim=1, keepdim=True))
-        
+
         div = components[0] + components[1]  # [B, 1, T, H, W]
+        div = torch.clamp(div, min=-10.0, max=10.0)
         return div
     
     @staticmethod
     def compute_laplacian(v):
         """
         计算拉普拉斯算子 ∇²v (有限差分，中心差分)
-        
+
         Args:
             v: [B, C, T, H, W]
         Returns:
             laplacian: [B, C, T, H, W]  (边界处为 0)
         """
+        # Clamp input to prevent overflow
+        v = torch.clamp(v, min=-10.0, max=10.0)
+
         parts = []
-        
+
         # H 方向二阶导数: d²v/dH²
         if v.shape[3] > 2:
             d2v_dh2 = v[:, :, :, 2:, :] - 2 * v[:, :, :, 1:-1, :] + v[:, :, :, :-2, :]
+            d2v_dh2 = torch.clamp(d2v_dh2, min=-10.0, max=10.0)
             # pad 回原始 H 尺寸（上下各一行0）
             d2v_dh2 = F.pad(d2v_dh2, (0, 0, 1, 1))  # (W_left, W_right, H_top, H_bottom)
             parts.append(d2v_dh2)
-        
+
         # W 方向二阶导数: d²v/dW²
         if v.shape[4] > 2:
             d2v_dw2 = v[:, :, :, :, 2:] - 2 * v[:, :, :, :, 1:-1] + v[:, :, :, :, :-2]
+            d2v_dw2 = torch.clamp(d2v_dw2, min=-10.0, max=10.0)
             d2v_dw2 = F.pad(d2v_dw2, (1, 1))  # pad W 方向
             parts.append(d2v_dw2)
-        
+
         if len(parts) == 0:
             return v * 0.0  # 保持 grad_fn
-        
+
         laplacian = sum(parts)
+        laplacian = torch.clamp(laplacian, min=-10.0, max=10.0)
         return laplacian
     
     @staticmethod
@@ -80,33 +91,40 @@ class DifferentialOperators:
         """
         计算 2D 涡量（旋度的 z 分量）
         curl_z ≈ dv_w/dH - dv_h/dW（跨通道的近似）
-        
+
         Args:
             v: [B, C, T, H, W]
         Returns:
             curl: [B, 1, T, H-1, W-1]  (内部区域)
         """
+        # Clamp input to prevent overflow
+        v = torch.clamp(v, min=-10.0, max=10.0)
+
         # dv/dH
         dv_dh = v[:, :, :, 1:, :] - v[:, :, :, :-1, :]  # [B, C, T, H-1, W]
+        dv_dh = torch.clamp(dv_dh, min=-10.0, max=10.0)
+
         # dv/dW
         dv_dw = v[:, :, :, :, 1:] - v[:, :, :, :, :-1]  # [B, C, T, H, W-1]
-        
+        dv_dw = torch.clamp(dv_dw, min=-10.0, max=10.0)
+
         # 对齐到相同的空间尺寸：取内部交叉区域
         dv_dh = dv_dh[:, :, :, :, :-1]  # [B, C, T, H-1, W-1]
         dv_dw = dv_dw[:, :, :, :-1, :]  # [B, C, T, H-1, W-1]
-        
+
         # 跨通道近似：前半通道作为 x 分量，后半通道作为 y 分量
         C = v.shape[1]
         half_C = max(C // 2, 1)
-        
+
         curl = dv_dw[:, :half_C].mean(dim=1, keepdim=True) - dv_dh[:, half_C:].mean(dim=1, keepdim=True)
+        curl = torch.clamp(curl, min=-10.0, max=10.0)
         return curl
 
 
 class MaterialPDEResiduals(nn.Module):
     """各种材质的PDE残差计算"""
     
-    def __init__(self, num_phenomena=17, q_input_dim=64, n_numeric_dim=12):
+    def __init__(self, num_phenomena=10, q_input_dim=64, n_numeric_dim=12):
         super().__init__()
         self.diff_ops = DifferentialOperators()
         self.num_phenomena = num_phenomena
@@ -114,12 +132,17 @@ class MaterialPDEResiduals(nn.Module):
         self.n_numeric_dim = n_numeric_dim
         self.enable_conditioning = True
         
-        # 物理参数（可学习）
+        # 物理参数（可学习，但有界）
         self.nu = nn.Parameter(torch.tensor(0.01))  # 粘度
         self.rho = nn.Parameter(torch.tensor(1.0))  # 密度
         self.lambda_lame = nn.Parameter(torch.tensor(1.0))  # 拉梅常数
         self.mu = nn.Parameter(torch.tensor(1.0))  # 剪切模量
         self.friction_coef = nn.Parameter(torch.tensor(0.1))  # 摩擦系数
+
+        # Register hooks to clamp parameters after each update
+        for param_name in ['nu', 'rho', 'lambda_lame', 'mu', 'friction_coef']:
+            param = getattr(self, param_name)
+            param.register_hook(lambda grad, pn=param_name: self._clamp_param_grad(pn, grad))
 
         # 条件调制参数：初始为零，使模型一开始接近原始残差形式
         self.label_embedding = nn.Embedding(num_phenomena, 4)
@@ -132,6 +155,23 @@ class MaterialPDEResiduals(nn.Module):
     @staticmethod
     def _zero_loss(v):
         return torch.mean(v ** 2) * 0.0
+
+    @staticmethod
+    def _safe_loss(loss, max_value=100.0):
+        """确保 loss 不是 NaN/Inf，并裁剪到合理范围"""
+        if loss is None:
+            return torch.tensor(0.0)
+
+        # Handle scalar tensors
+        if loss.dim() == 0:
+            if torch.isnan(loss) or torch.isinf(loss):
+                return torch.tensor(0.0, device=loss.device, dtype=loss.dtype)
+            return torch.clamp(loss, min=-max_value, max=max_value)
+
+        # Handle multi-dimensional tensors
+        loss = torch.where(torch.isnan(loss) | torch.isinf(loss),
+                          torch.zeros_like(loss), loss)
+        return torch.clamp(loss, min=-max_value, max=max_value)
 
     @staticmethod
     def _metadata_label_name(metadata):
@@ -248,16 +288,29 @@ class MaterialPDEResiduals(nn.Module):
         return torch.clamp(mask, 0.0, 1.0)
 
     def _weighted_mean(self, value, metadata=None, ref_tensor=None):
+        # Aggressive clamping at input
+        value = torch.clamp(value, min=-100.0, max=100.0)
+
         ref = value if ref_tensor is None else ref_tensor
         mask = self._resolve_motion_mask(metadata, value, ref)
+
         if mask is None:
-            return torch.mean(value)
-        numer = torch.sum(value * mask)
-        denom = torch.sum(mask) + 1e-6
-        return numer / denom
+            result = torch.mean(value)
+        else:
+            numer = torch.sum(value * mask)
+            denom = torch.sum(mask) + 1e-8  # Increased epsilon
+            result = numer / denom
+
+        # Ensure result is finite
+        if torch.isnan(result) or torch.isinf(result):
+            return torch.tensor(0.0, device=value.device, dtype=value.dtype)
+
+        return torch.clamp(result, min=-100.0, max=100.0)
 
     def _weighted_square_mean(self, value, metadata=None, ref_tensor=None):
-        return self._weighted_mean(value ** 2, metadata=metadata, ref_tensor=ref_tensor)
+        # Clamp value to prevent overflow in squaring
+        value_clamped = torch.clamp(value, min=-10.0, max=10.0)
+        return self._weighted_mean(value_clamped ** 2, metadata=metadata, ref_tensor=ref_tensor)
 
     def _spatial_gradient_energy(self, v, metadata=None):
         parts = []
@@ -269,9 +322,63 @@ class MaterialPDEResiduals(nn.Module):
             return self._zero_loss(v)
         return sum(parts) / len(parts)
 
+    def _divergence_field(self, v):
+        """Compute divergence field using diff_ops."""
+        return self.diff_ops.compute_divergence(v)
+
+    def _laplacian_field(self, v, metadata=None):
+        """Compute laplacian field using diff_ops, with optional motion weighting."""
+        del metadata  # Reserved for future use
+        return self.diff_ops.compute_laplacian(v)
+
+    def _vorticity_field(self, v):
+        """Compute vorticity field (curl) using diff_ops."""
+        return self.diff_ops.compute_curl_2d(v)
+
     def set_conditioning_enabled(self, enabled=True):
         """启用/禁用 metadata 条件化调制"""
         self.enable_conditioning = bool(enabled)
+
+    def _clamp_param_grad(self, param_name, grad):
+        """Clamp gradients to prevent parameter explosion"""
+        if grad is not None:
+            return torch.clamp(grad, min=-0.1, max=0.1)
+        return grad
+
+    def _clamp_parameters(self):
+        """Clamp physical parameters to valid ranges"""
+        with torch.no_grad():
+            self.nu.data = torch.clamp(self.nu.data, min=0.001, max=0.1)
+            self.rho.data = torch.clamp(self.rho.data, min=0.1, max=10.0)
+            self.lambda_lame.data = torch.clamp(self.lambda_lame.data, min=0.1, max=10.0)
+            self.mu.data = torch.clamp(self.mu.data, min=0.1, max=10.0)
+            self.friction_coef.data = torch.clamp(self.friction_coef.data, min=0.01, max=1.0)
+
+    def _ensure_finite_loss(self, loss, info, method_name="unknown"):
+        """Ensure loss and info values are finite"""
+        if torch.isnan(loss) or torch.isinf(loss):
+            print(f"[WARNING] NaN/Inf in {method_name}, clamping to 0")
+            loss = torch.zeros_like(loss)
+        else:
+            loss = torch.clamp(loss, min=0.0, max=100.0)
+
+        # Clean up info dict
+        clean_info = {}
+        for k, v in info.items():
+            if isinstance(v, torch.Tensor):
+                if torch.isnan(v) or torch.isinf(v):
+                    clean_info[k] = 0.0
+                else:
+                    clean_info[k] = float(torch.clamp(v, min=-100.0, max=100.0).detach().item())
+            elif isinstance(v, (int, float)):
+                if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
+                    clean_info[k] = 0.0
+                else:
+                    clean_info[k] = float(v)
+            else:
+                clean_info[k] = v
+
+        return loss, clean_info
     
     def _base_fluid_terms(self, z, v, metadata=None):
         """
@@ -279,12 +386,15 @@ class MaterialPDEResiduals(nn.Module):
         仅供现象级 residual 复用。
         """
         del z
+        self._clamp_parameters()  # Ensure parameters are in valid range
         scales = self._conditioned_scales(metadata, v)
         div_v = self.diff_ops.compute_divergence(v)
         loss_continuity = self._weighted_square_mean(div_v, metadata=metadata, ref_tensor=v) * scales["s0"]
 
         laplacian_v = self.diff_ops.compute_laplacian(v)
-        loss_viscosity = -self._weighted_mean(self.nu * laplacian_v * v, metadata=metadata, ref_tensor=v) * scales["s1"]
+        # Clamp nu to prevent numerical issues
+        nu_safe = torch.clamp(self.nu, min=0.001, max=0.1)
+        loss_viscosity = -self._weighted_mean(nu_safe * laplacian_v * v, metadata=metadata, ref_tensor=v) * scales["s1"]
 
         curl_v = self.diff_ops.compute_curl_2d(v)
         if curl_v.shape[2] > 1:
@@ -293,7 +403,13 @@ class MaterialPDEResiduals(nn.Module):
         else:
             loss_vorticity = self._zero_loss(v)
 
+        # 安全处理各项损失
+        loss_continuity = self._safe_loss(loss_continuity)
+        loss_viscosity = self._safe_loss(loss_viscosity)
+        loss_vorticity = self._safe_loss(loss_vorticity)
+
         total_loss = loss_continuity + loss_viscosity * 0.1 + loss_vorticity
+        total_loss = self._safe_loss(total_loss)
         return total_loss, {
             "continuity": float(loss_continuity.detach().item()),
             "viscosity": float(loss_viscosity.detach().item()),
@@ -328,7 +444,12 @@ class MaterialPDEResiduals(nn.Module):
         else:
             loss_momentum = self._zero_loss(v)
 
+        # 安全处理各项损失
+        loss_rigidity = self._safe_loss(loss_rigidity)
+        loss_momentum = self._safe_loss(loss_momentum)
+
         total_loss = loss_rigidity + loss_momentum
+        total_loss = self._safe_loss(total_loss)
         return total_loss, {
             "rigidity": float(loss_rigidity.detach().item()),
             "momentum": float(loss_momentum.detach().item()),
@@ -342,10 +463,16 @@ class MaterialPDEResiduals(nn.Module):
         仅供现象级 residual 复用。
         """
         del z
+        self._clamp_parameters()  # Ensure parameters are in valid range
         scales = self._conditioned_scales(metadata, v)
         laplacian_v = self.diff_ops.compute_laplacian(v)
+
+        # Clamp Lamé parameters to prevent numerical issues
+        lambda_safe = torch.clamp(self.lambda_lame, min=0.1, max=10.0)
+        mu_safe = torch.clamp(self.mu, min=0.1, max=10.0)
+
         strain_energy = self._weighted_mean(
-            (self.lambda_lame + 2 * self.mu) * laplacian_v * v,
+            (lambda_safe + 2 * mu_safe) * laplacian_v * v,
             metadata=metadata,
             ref_tensor=v,
         ) * scales["s0"]
@@ -356,6 +483,9 @@ class MaterialPDEResiduals(nn.Module):
             loss_wave = self._weighted_square_mean(acceleration, metadata=metadata, ref_tensor=v) * 0.1 * scales["s2"]
         else:
             loss_wave = self._zero_loss(v)
+
+        loss_elastic = self._safe_loss(loss_elastic)
+        loss_wave = self._safe_loss(loss_wave)
 
         total_loss = loss_elastic + loss_wave
         return total_loss, {
@@ -371,10 +501,14 @@ class MaterialPDEResiduals(nn.Module):
         仅供现象级 residual 复用。
         """
         del z
+        self._clamp_parameters()  # Ensure parameters are in valid range
         scales = self._conditioned_scales(metadata, v)
         grad_v = self.diff_ops.compute_laplacian(v)
         contact_force = self._weighted_mean(grad_v * v, metadata=metadata, ref_tensor=v) * 0.01 * scales["s0"]
-        friction_force = self._weighted_square_mean(v, metadata=metadata, ref_tensor=v) * self.friction_coef * scales["s1"]
+
+        # Clamp friction coefficient to prevent numerical issues
+        friction_safe = torch.clamp(self.friction_coef, min=0.01, max=1.0)
+        friction_force = self._weighted_square_mean(v, metadata=metadata, ref_tensor=v) * friction_safe * scales["s1"]
 
         if v.shape[2] > 1:
             collision = self._weighted_square_mean(
@@ -382,6 +516,10 @@ class MaterialPDEResiduals(nn.Module):
             ) * 0.1 * scales["s2"]
         else:
             collision = self._zero_loss(v)
+
+        contact_force = self._safe_loss(contact_force)
+        friction_force = self._safe_loss(friction_force)
+        collision = self._safe_loss(collision)
 
         total_loss = contact_force + friction_force + collision
         return total_loss, {
@@ -501,10 +639,16 @@ class MaterialPDEResiduals(nn.Module):
         centered_v = v - v.mean(dim=(3, 4), keepdim=True)
         rigid_coherence = self._weighted_square_mean(centered_v, metadata=metadata, ref_tensor=v) * 0.05 * scales["s1"]
         total_loss = base_loss + spatial_coherence + rigid_coherence
+
+        # Ensure finite
+        total_loss = torch.clamp(total_loss, min=0.0, max=100.0)
+        if torch.isnan(total_loss) or torch.isinf(total_loss):
+            total_loss = torch.zeros_like(total_loss)
+
         info = dict(base_info)
         info.update({
-            "mechanical_spatial": float(spatial_coherence.detach().item()),
-            "rigid_coherence": float(rigid_coherence.detach().item()),
+            "mechanical_spatial": float(torch.clamp(spatial_coherence, min=0.0, max=100.0).detach().item()) if not (torch.isnan(spatial_coherence) or torch.isinf(spatial_coherence)) else 0.0,
+            "rigid_coherence": float(torch.clamp(rigid_coherence, min=0.0, max=100.0).detach().item()) if not (torch.isnan(rigid_coherence) or torch.isinf(rigid_coherence)) else 0.0,
         })
         return total_loss, info
 
@@ -529,16 +673,29 @@ class MaterialPDEResiduals(nn.Module):
     def liquid_motion_residual(self, z, v, t=None, metadata=None):
         del t
         base_loss, base_info = self._base_fluid_terms(z, v, metadata=metadata)
+        base_loss = torch.clamp(base_loss, min=0.0, max=100.0)
+        if torch.isnan(base_loss) or torch.isinf(base_loss):
+            base_loss = torch.zeros_like(base_loss)
+
         scales = self._conditioned_scales(metadata, v)
         field = self._scalar_field(v)
         field_dt = self._temporal_difference(field, order=1)
-        surface_transport = (
-            self._weighted_square_mean(field_dt, metadata=metadata, ref_tensor=v) * 0.05 * scales["s2"]
-            if field_dt is not None else self._zero_loss(v)
-        )
+
+        if field_dt is not None:
+            surface_transport = self._weighted_square_mean(field_dt, metadata=metadata, ref_tensor=v) * 0.05 * scales["s2"]
+            surface_transport = torch.clamp(surface_transport, min=0.0, max=100.0)
+            if torch.isnan(surface_transport) or torch.isinf(surface_transport):
+                surface_transport = torch.zeros_like(surface_transport)
+        else:
+            surface_transport = self._zero_loss(v)
+
         total_loss = base_loss + surface_transport
+        total_loss = torch.clamp(total_loss, min=0.0, max=100.0)
+        if torch.isnan(total_loss) or torch.isinf(total_loss):
+            total_loss = torch.zeros_like(total_loss)
+
         info = dict(base_info)
-        info["surface_transport"] = float(surface_transport.detach().item())
+        info["surface_transport"] = float(surface_transport.detach().item()) if not (torch.isnan(surface_transport) or torch.isinf(surface_transport)) else 0.0
         return total_loss, info
 
     def gas_motion_residual(self, z, v, t=None, metadata=None):
@@ -765,6 +922,323 @@ class MaterialPDEResiduals(nn.Module):
             "cond_s0": float(ctx["scales"]["s0"].detach().item()),
             "cond_s1": float(ctx["scales"]["s1"].detach().item()),
             "cond_s2": float(ctx["scales"]["s2"].detach().item()),
+        }
+
+    # ========================================================================
+    # 10 Physics-Based Phenomenon Residuals (Aligned with Table 1)
+    # ========================================================================
+
+    def rigid_body_residual(self, z, v, t=None, metadata=None):
+        """
+        1. Rigid Body: s0||sym(∇u)||² + s1||Δu||²
+        Strain minimization + smoothness
+        """
+        del t
+        scales = self._conditioned_scales(metadata, v)
+
+        # sym(∇u): strain rate (symmetric gradient)
+        strain = self._spatial_gradient_energy(v, metadata=metadata)
+        strain_term = strain * scales["s0"]
+
+        # Δu: Laplacian smoothness
+        lap = self._laplacian_field(v, metadata=metadata)
+        smoothness = self._weighted_square_mean(lap, metadata=metadata, ref_tensor=v) * scales["s1"]
+
+        total_loss = strain_term + smoothness
+        total_loss = torch.clamp(total_loss, min=0.0, max=100.0)
+
+        return total_loss, {
+            "rigid_strain": float(strain_term.detach().item()),
+            "rigid_smoothness": float(smoothness.detach().item()),
+            "cond_s0": float(scales["s0"].detach().item()),
+            "cond_s1": float(scales["s1"].detach().item()),
+        }
+
+    def elastic_residual(self, z, v, t=None, metadata=None):
+        """
+        2. Elastic: s0||Δu||² + s1||∂²u/∂t²||² + s2||sym(∇u)||²
+        Wave dynamics + strain
+        """
+        del t
+        scales = self._conditioned_scales(metadata, v)
+
+        # Δu: spatial smoothness
+        lap = self._laplacian_field(v, metadata=metadata)
+        smoothness = self._weighted_square_mean(lap, metadata=metadata, ref_tensor=v) * scales["s0"]
+
+        # ∂²u/∂t²: acceleration (wave dynamics)
+        second_dt = self._temporal_difference(v, order=2)
+        if second_dt is not None:
+            wave_dynamics = self._weighted_square_mean(second_dt, metadata=metadata, ref_tensor=v) * scales["s1"]
+        else:
+            wave_dynamics = self._zero_loss(v)
+
+        # sym(∇u): strain
+        strain = self._spatial_gradient_energy(v, metadata=metadata) * scales["s2"]
+
+        total_loss = smoothness + wave_dynamics + strain
+        total_loss = torch.clamp(total_loss, min=0.0, max=100.0)
+
+        return total_loss, {
+            "elastic_smoothness": float(smoothness.detach().item()),
+            "elastic_wave": float(wave_dynamics.detach().item()),
+            "elastic_strain": float(strain.detach().item()),
+            "cond_s0": float(scales["s0"].detach().item()),
+            "cond_s1": float(scales["s1"].detach().item()),
+            "cond_s2": float(scales["s2"].detach().item()),
+        }
+
+    def fluid_residual(self, z, v, t=None, metadata=None):
+        """
+        3. Fluid: s0|∇·u|² + s1·ν||∇u||² + s2|∇×u|²
+        Continuity + viscosity + vorticity
+        """
+        del t
+        scales = self._conditioned_scales(metadata, v)
+
+        # ∇·u: divergence (continuity)
+        div = self._divergence_field(v)
+        continuity = self._weighted_square_mean(div, metadata=metadata, ref_tensor=v) * scales["s0"]
+
+        # ||∇u||²: velocity gradient (viscosity)
+        viscosity = self._spatial_gradient_energy(v, metadata=metadata) * scales["s1"]
+
+        # ∇×u: vorticity (curl)
+        vorticity = self._vorticity_field(v)
+        vorticity_term = self._weighted_square_mean(vorticity, metadata=metadata, ref_tensor=v) * scales["s2"]
+
+        total_loss = continuity + viscosity + vorticity_term
+        total_loss = torch.clamp(total_loss, min=0.0, max=100.0)
+
+        return total_loss, {
+            "fluid_continuity": float(continuity.detach().item()),
+            "fluid_viscosity": float(viscosity.detach().item()),
+            "fluid_vorticity": float(vorticity_term.detach().item()),
+            "cond_s0": float(scales["s0"].detach().item()),
+            "cond_s1": float(scales["s1"].detach().item()),
+            "cond_s2": float(scales["s2"].detach().item()),
+        }
+
+    def compressible_flow_residual(self, z, v, t=None, metadata=None):
+        """
+        4. Compressible Flow: s0|∇·u|² + s1||∂t(∇·u)||² + s2||∇u||²
+        Mass conservation + dynamics
+        """
+        del t
+        scales = self._conditioned_scales(metadata, v)
+
+        # ∇·u: divergence (mass conservation)
+        div = self._divergence_field(v)
+        mass_conservation = self._weighted_square_mean(div, metadata=metadata, ref_tensor=v) * scales["s0"]
+
+        # ∂t(∇·u): rate of compression/expansion
+        div_dt = self._temporal_difference(div, order=1)
+        if div_dt is not None:
+            compression_dynamics = self._weighted_square_mean(div_dt, metadata=metadata, ref_tensor=v) * scales["s1"]
+        else:
+            compression_dynamics = self._zero_loss(v)
+
+        # ||∇u||²: velocity gradient
+        grad = self._spatial_gradient_energy(v, metadata=metadata) * scales["s2"]
+
+        total_loss = mass_conservation + compression_dynamics + grad
+        total_loss = torch.clamp(total_loss, min=0.0, max=100.0)
+
+        return total_loss, {
+            "compressible_mass": float(mass_conservation.detach().item()),
+            "compressible_dynamics": float(compression_dynamics.detach().item()),
+            "compressible_gradient": float(grad.detach().item()),
+            "cond_s0": float(scales["s0"].detach().item()),
+            "cond_s1": float(scales["s1"].detach().item()),
+            "cond_s2": float(scales["s2"].detach().item()),
+        }
+
+    def phase_change_residual(self, z, v, t=None, metadata=None):
+        """
+        5. Phase Change: s0|∇·u|² + s1||∂t u||² + s2||Δu||²
+        Expansion + latent heat effects
+        """
+        del t
+        scales = self._conditioned_scales(metadata, v)
+
+        # ∇·u: volumetric expansion/contraction
+        div = self._divergence_field(v)
+        expansion = self._weighted_square_mean(div, metadata=metadata, ref_tensor=v) * scales["s0"]
+
+        # ∂t u: rate of change (latent heat transfer)
+        first_dt = self._temporal_difference(v, order=1)
+        if first_dt is not None:
+            latent_heat = self._weighted_square_mean(first_dt, metadata=metadata, ref_tensor=v) * scales["s1"]
+        else:
+            latent_heat = self._zero_loss(v)
+
+        # Δu: spatial smoothness (phase boundary)
+        lap = self._laplacian_field(v, metadata=metadata)
+        smoothness = self._weighted_square_mean(lap, metadata=metadata, ref_tensor=v) * scales["s2"]
+
+        total_loss = expansion + latent_heat + smoothness
+        total_loss = torch.clamp(total_loss, min=0.0, max=100.0)
+
+        return total_loss, {
+            "phase_expansion": float(expansion.detach().item()),
+            "phase_latent_heat": float(latent_heat.detach().item()),
+            "phase_smoothness": float(smoothness.detach().item()),
+            "cond_s0": float(scales["s0"].detach().item()),
+            "cond_s1": float(scales["s1"].detach().item()),
+            "cond_s2": float(scales["s2"].detach().item()),
+        }
+
+    def collision_contact_residual(self, z, v, t=None, metadata=None):
+        """
+        6. Collision/Contact: s0|∇·u|² + s1||∂t u||² + s2||∇²u||²
+        Momentum exchange + acceleration
+        """
+        del t
+        scales = self._conditioned_scales(metadata, v)
+
+        # ∇·u: compression at contact point
+        div = self._divergence_field(v)
+        compression = self._weighted_square_mean(div, metadata=metadata, ref_tensor=v) * scales["s0"]
+
+        # ∂t u: acceleration (momentum exchange)
+        first_dt = self._temporal_difference(v, order=1)
+        if first_dt is not None:
+            acceleration = self._weighted_square_mean(first_dt, metadata=metadata, ref_tensor=v) * scales["s1"]
+        else:
+            acceleration = self._zero_loss(v)
+
+        # ∇²u: second-order spatial (impact propagation)
+        second_grad = self._laplacian_field(v, metadata=metadata)
+        impact = self._weighted_square_mean(second_grad, metadata=metadata, ref_tensor=v) * scales["s2"]
+
+        total_loss = compression + acceleration + impact
+        total_loss = torch.clamp(total_loss, min=0.0, max=100.0)
+
+        return total_loss, {
+            "collision_compression": float(compression.detach().item()),
+            "collision_acceleration": float(acceleration.detach().item()),
+            "collision_impact": float(impact.detach().item()),
+            "cond_s0": float(scales["s0"].detach().item()),
+            "cond_s1": float(scales["s1"].detach().item()),
+            "cond_s2": float(scales["s2"].detach().item()),
+        }
+
+    def granular_residual(self, z, v, t=None, metadata=None):
+        """
+        7. Granular: s0||∇u||² + s1||div(|u|u)||²
+        Friction + inertial effects
+        """
+        del t
+        scales = self._conditioned_scales(metadata, v)
+
+        # ||∇u||²: velocity gradient (friction)
+        grad = self._spatial_gradient_energy(v, metadata=metadata) * scales["s0"]
+
+        # div(|u|u): inertial term (nonlinear advection)
+        speed = torch.sqrt((v ** 2).sum(dim=1, keepdim=True) + 1e-10)
+        inertial_field = speed * v
+        div_inertial = self._divergence_field(inertial_field)
+        inertial = self._weighted_square_mean(div_inertial, metadata=metadata, ref_tensor=v) * scales["s1"]
+
+        total_loss = grad + inertial
+        total_loss = torch.clamp(total_loss, min=0.0, max=100.0)
+
+        return total_loss, {
+            "granular_friction": float(grad.detach().item()),
+            "granular_inertial": float(inertial.detach().item()),
+            "cond_s0": float(scales["s0"].detach().item()),
+            "cond_s1": float(scales["s1"].detach().item()),
+        }
+
+    def fracture_residual(self, z, v, t=None, metadata=None):
+        """
+        8. Fracture: s0||∂t u||² + s1||Δu||² + s2|∇·u|
+        Energy release + crack dynamics
+        """
+        del t
+        scales = self._conditioned_scales(metadata, v)
+
+        # ∂t u: velocity (energy release rate)
+        first_dt = self._temporal_difference(v, order=1)
+        if first_dt is not None:
+            energy_release = self._weighted_square_mean(first_dt, metadata=metadata, ref_tensor=v) * scales["s0"]
+        else:
+            energy_release = self._zero_loss(v)
+
+        # Δu: crack tip singularity (Laplacian)
+        lap = self._laplacian_field(v, metadata=metadata)
+        crack_dynamics = self._weighted_square_mean(lap, metadata=metadata, ref_tensor=v) * scales["s1"]
+
+        # ∇·u: volumetric strain (crack opening)
+        div = self._divergence_field(v)
+        crack_opening = self._weighted_mean(div.abs(), metadata=metadata, ref_tensor=v) * scales["s2"]
+
+        total_loss = energy_release + crack_dynamics + crack_opening
+        total_loss = torch.clamp(total_loss, min=0.0, max=100.0)
+
+        return total_loss, {
+            "fracture_energy": float(energy_release.detach().item()),
+            "fracture_crack": float(crack_dynamics.detach().item()),
+            "fracture_opening": float(crack_opening.detach().item()),
+            "cond_s0": float(scales["s0"].detach().item()),
+            "cond_s1": float(scales["s1"].detach().item()),
+            "cond_s2": float(scales["s2"].detach().item()),
+        }
+
+    def thermal_residual(self, z, v, t=None, metadata=None):
+        """
+        9. Thermal: s0||∂t T||² + s1||ΔT||²
+        Energy diffusion (applied to temperature field)
+        Note: For velocity field, we apply smoothness + temporal coherence
+        """
+        del t
+        scales = self._conditioned_scales(metadata, v)
+
+        # ∂t v: temporal change (analogous to ∂t T)
+        first_dt = self._temporal_difference(v, order=1)
+        if first_dt is not None:
+            temporal_diffusion = self._weighted_square_mean(first_dt, metadata=metadata, ref_tensor=v) * scales["s0"]
+        else:
+            temporal_diffusion = self._zero_loss(v)
+
+        # Δv: spatial diffusion (analogous to ΔT)
+        lap = self._laplacian_field(v, metadata=metadata)
+        spatial_diffusion = self._weighted_square_mean(lap, metadata=metadata, ref_tensor=v) * scales["s1"]
+
+        total_loss = temporal_diffusion + spatial_diffusion
+        total_loss = torch.clamp(total_loss, min=0.0, max=100.0)
+
+        return total_loss, {
+            "thermal_temporal": float(temporal_diffusion.detach().item()),
+            "thermal_spatial": float(spatial_diffusion.detach().item()),
+            "cond_s0": float(scales["s0"].detach().item()),
+            "cond_s1": float(scales["s1"].detach().item()),
+        }
+
+    def optical_residual(self, z, v, t=None, metadata=None):
+        """
+        10. Optical: s0||Δu||² + s1|∇·u|²
+        Wave propagation + interference
+        """
+        del t
+        scales = self._conditioned_scales(metadata, v)
+
+        # Δu: wave equation (spatial propagation)
+        lap = self._laplacian_field(v, metadata=metadata)
+        wave_propagation = self._weighted_square_mean(lap, metadata=metadata, ref_tensor=v) * scales["s0"]
+
+        # ∇·u: divergence (wave interference pattern)
+        div = self._divergence_field(v)
+        interference = self._weighted_square_mean(div, metadata=metadata, ref_tensor=v) * scales["s1"]
+
+        total_loss = wave_propagation + interference
+        total_loss = torch.clamp(total_loss, min=0.0, max=100.0)
+
+        return total_loss, {
+            "optical_wave": float(wave_propagation.detach().item()),
+            "optical_interference": float(interference.detach().item()),
+            "cond_s0": float(scales["s0"].detach().item()),
+            "cond_s1": float(scales["s1"].detach().item()),
         }
 
 

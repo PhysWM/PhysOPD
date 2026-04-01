@@ -28,7 +28,7 @@ from transformers.modeling_outputs import (
     CausalLMOutputWithPast,
     SequenceClassifierOutputWithPast,
 )
-from transformers.modeling_utils import PreTrainedModel
+from transformers import PreTrainedModel
 from transformers.utils import logging
 from transformers.generation.logits_process import LogitsProcessor
 from transformers.generation.utils import LogitsProcessorList, StoppingCriteriaList, GenerationConfig, ModelOutput

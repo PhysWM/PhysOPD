@@ -1,30 +1,41 @@
 #!/bin/bash
 set -euo pipefail
 
-# # Basic inference (no explicit metadata; adapter falls back automatically)
-# python examples/wanvideo/pinn_inference/inference_pinn.py \
-#     --prompt "Two oranges fall into the lake." \
-#     --checkpoint_path models/train/pinn_plugin_low_noise/pinn_plugin_final.pt \
-#     --output video_pinn_basic.mp4
+if [[ -f ".pinn_api.env" ]]; then
+    set -a
+    source ".pinn_api.env"
+    set +a
+fi
 
-# Raw n/q metadata inference (recommended for MoE routing control)
-# You can pass raw fields directly; script will auto-encode to adapter metadata.
+# OpenAI-compatible API config example:
+# export OPENAI_API_KEY=...
+# export OPENAI_BASE_URL=https://api.openai.com/v1
+# export OPENAI_MODEL=gpt-4.1-mini
 
+# Basic inference with automatic LLM routing labels
 python examples/wanvideo/pinn_inference/inference_pinn.py \
-    --prompt "A volleyball falls into the lake." \
+    --prompt "Bottle topples off the table." \
     --checkpoint_path models/train/pinn_plugin_low_noise/pinn_plugin_final.pt \
-    --metadata_json '{
-      "label":"liquid motion",
-      "n0":"speed around 1.2 to 2.0",
-      "n1":"density 0.5~0.7",
-      "n2":"viscosity 0.01",
-      "q0":"splash, ripple",
-      "q1":"surface tension",
-      "q2":"wake trail",
-      "q3":"no",
-      "q4":"reflection and refraction"
-    }' \
-    --output video_pinn_with_raw_metadata6.mp4
+    --auto_label_from_prompt \
+    --output video_pinn_bottle.mp4
+
+# Raw n/q metadata inference (recommended if you want to override routing manually)
+# You can pass raw fields directly; script will auto-encode to adapter metadata.
+# python examples/wanvideo/pinn_inference/inference_pinn.py \
+#     --prompt "I put an ice cube in my hot coffee, and it melted." \
+#     --checkpoint_path models/train/pinn_plugin_low_noise/pinn_plugin_final.pt \
+#     --metadata_json '{
+#       "label":"Fluid, Thermal, Phase Change",
+#       "n0":"speed around 1.2 to 2.0",
+#       "n1":"density 0.5~0.7",
+#       "n2":"viscosity 0.01",
+#       "q0":"splash, ripple",
+#       "q1":"surface tension",
+#       "q2":"wake trail",
+#       "q3":"no",
+#       "q4":"reflection and refraction"
+#     }' \
+#     --output video_pinn_with_raw_metadata19.mp4
 
 # python examples/wanvideo/pinn_inference/inference_pinn.py \
 #   --prompt "Three tennis balls fall onto the ground." \

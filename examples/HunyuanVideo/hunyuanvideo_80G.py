@@ -1,3 +1,4 @@
+import os
 import torch
 torch.cuda.set_per_process_memory_fraction(1.0, 0)
 from diffsynth import ModelManager, HunyuanVideoPipeline, download_models, save_video
@@ -40,6 +41,10 @@ pipe = HunyuanVideoPipeline.from_model_manager(
 pipe.enable_cpu_offload()
 
 # Enjoy!
-prompt = "CG, masterpiece, best quality, solo, long hair, wavy hair, silver hair, blue eyes, blue dress, medium breasts, dress, underwater, air bubble, floating hair, refraction, portrait. The girl's flowing silver hair shimmers with every color of the rainbow and cascades down, merging with the floating flora around her."
+prompt = os.environ.get(
+    "HUNYUAN_PROMPT",
+    "CG, masterpiece, best quality, solo, long hair, wavy hair, silver hair, blue eyes, blue dress, medium breasts, dress, underwater, air bubble, floating hair, refraction, portrait. The girl's flowing silver hair shimmers with every color of the rainbow and cascades down, merging with the floating flora around her."
+)
+output_path = os.environ.get("HUNYUAN_OUTPUT", "video.mp4")
 video = pipe(prompt, seed=0)
-save_video(video, "video.mp4", fps=30, quality=6)
+save_video(video, output_path, fps=30, quality=6)

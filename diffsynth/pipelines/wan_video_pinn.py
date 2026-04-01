@@ -16,23 +16,9 @@ from typing import Union
 
 
 PHENOMENON_LABELS = [
-    "rigid body motion",
-    "collision",
-    "liquid motion",
-    "gas motion",
-    "elastic motion",
-    "deformation",
-    "melting",
-    "solidification",
-    "vaporization",
-    "liquefaction",
-    "combustion",
-    "explosion",
-    "reflection",
-    "refraction",
-    "scattering",
-    "interference and diffraction",
-    "unnatural light source",
+    # 10 physics-based categories aligned with Table 1
+    "Rigid Body", "Elastic", "Fluid", "Compressible Flow", "Phase Change",
+    "Collision/Contact", "Granular", "Fracture", "Thermal", "Optical",
 ]
 PHENOMENON_TO_ID = {name: idx for idx, name in enumerate(PHENOMENON_LABELS)}
 
@@ -96,24 +82,40 @@ class PhysicsInformedWanVideoPipeline(WanVideoPipeline):
         if not isinstance(raw_metadata, dict):
             return None
 
+        # 优先使用多标签列表 label_ids，回退到单标签 label_id
+        label_ids_list = raw_metadata.get("label_ids")
         label_id = raw_metadata.get("label_id")
         label_name = str(raw_metadata.get("label_name", "")).strip().lower()
-        if label_id is None and label_name != "":
-            label_id = PHENOMENON_TO_ID.get(label_name, 0)
-        if isinstance(label_id, str):
-            label_id = int(label_id.strip()) if label_id.strip() != "" else None
 
-        if label_id is None:
-            label_ids = torch.zeros(batch_size, device=device, dtype=torch.long)
+        if label_ids_list is not None and len(label_ids_list) > 0:
+            # 使用多标签列表
+            label_ids_tensor = torch.tensor(label_ids_list, device=device, dtype=torch.long)
+        elif label_id is not None and label_id != "":
+            # 回退到单标签
+            if isinstance(label_id, str):
+                label_id = int(label_id.strip()) if label_id.strip() != "" else 0
+            label_ids_tensor = torch.tensor([int(label_id)], device=device, dtype=torch.long)
+        elif label_name != "":
+            # 从 label_name 解析（支持逗号分隔的多标签）
+            parsed_ids = []
+            for part in label_name.split(","):
+                part = part.strip()
+                if part in PHENOMENON_TO_ID:
+                    parsed_ids.append(PHENOMENON_TO_ID[part])
+            if parsed_ids:
+                label_ids_tensor = torch.tensor(parsed_ids, device=device, dtype=torch.long)
+            else:
+                label_ids_tensor = torch.zeros(1, device=device, dtype=torch.long)
         else:
-            label_ids = label_id if isinstance(label_id, torch.Tensor) else torch.tensor(label_id)
-            label_ids = label_ids.to(device=device, dtype=torch.long).view(-1)
-            if label_ids.numel() == 1:
-                label_ids = label_ids.repeat(batch_size)
-            elif label_ids.numel() != batch_size:
-                label_ids = label_ids[:1].repeat(batch_size)
-        max_label = max(int(getattr(self.physics_adapter, "num_phenomena", 17)) - 1, 0)
-        label_ids = torch.clamp(label_ids, min=0, max=max_label)
+            label_ids_tensor = torch.zeros(1, device=device, dtype=torch.long)
+
+        # 限制标签值范围
+        max_label = max(int(getattr(self.physics_adapter, "num_phenomena", 10)) - 1, 0)
+        label_ids_tensor = torch.clamp(label_ids_tensor, min=0, max=max_label)
+
+        # 保存多标签列表用于 routing
+        label_ids_list = label_ids_tensor.tolist()
+        primary_label_id = int(label_ids_list[0]) if label_ids_list else 0
 
         n_numeric_dim = int(getattr(self.physics_adapter, "n_numeric_dim", 0))
         q_input_dim = int(getattr(self.physics_adapter, "q_input_dim", 0))
@@ -155,7 +157,8 @@ class PhysicsInformedWanVideoPipeline(WanVideoPipeline):
         n_text_ids = torch.clamp(n_text_ids, min=0, max=n_text_vocab)
 
         metadata = {
-            "label_id": label_ids,
+            "label_id": primary_label_id,  # 主标签（单个整数，保持兼容）
+            "label_ids": label_ids_list,   # 多标签列表（用于多标签路由）
             "n_numeric": n_numeric,
             "n_text_ids": n_text_ids,
             "q_vector": q_vector,
@@ -443,8 +446,8 @@ class PhysicsInformedWanVideoPipeline(WanVideoPipeline):
         """
         if device is None:
             device = self.device
-        
-        checkpoint = torch.load(checkpoint_path, map_location=device)
+
+        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
         
         if 'physics_adapter_state_dict' in checkpoint:
             latent_dim = 16

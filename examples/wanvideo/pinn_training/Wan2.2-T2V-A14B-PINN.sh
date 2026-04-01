@@ -13,6 +13,8 @@
 # =============================================================================
 
 set -euo pipefail
+# unset PINN_CHECKPOINT
+export PINN_CHECKPOINT="./models/train/pinn_plugin_low_noise/step-15000.pt"
 
 # ------------------------
 # Distributed launch safety
@@ -75,15 +77,57 @@ ACCELERATE_LAUNCH_ARGS=(
 
 
 
+# 可选：从 checkpoint 恢复训练（设置路径或留空）
+PINN_CHECKPOINT="${PINN_CHECKPOINT:-}"  # 例如: ./models/train/pinn_plugin_low_noise/step-200.pt
+
 # ========================
 # 训练 low noise 区间
 # boundary corresponds to timesteps [0, 875)
 # ========================
+
+# 构建 checkpoint 参数（如果设置了）
+PINN_CHECKPOINT_ARG=""
+if [[ -n "${PINN_CHECKPOINT}" ]]; then
+  PINN_CHECKPOINT_ARG="--pinn_checkpoint ${PINN_CHECKPOINT}"
+fi
+
+# accelerate launch \
+#   "${ACCELERATE_LAUNCH_ARGS[@]}" \
+#   examples/wanvideo/pinn_training/train_pinn.py \
+#   --dataset_base_path /home/dataset-assist-0/algorithm/cong.wang/cvpr/wisa-dataset/WISA-80K/data \
+#   --dataset_metadata_path /home/dataset-assist-0/algorithm/cong.wang/cvpr/wisa-dataset/WISA-80K/data/metadata_standard.csv \
+#   --height "${HEIGHT}" \
+#   --width "${WIDTH}" \
+#   --num_frames "${NUM_FRAMES}" \
+#   --dataset_repeat 1 \
+#   --model_id_with_origin_paths "Wan-AI/Wan2.2-T2V-A14B:low_noise_model/diffusion_pytorch_model*.safetensors,Wan-AI/Wan2.2-T2V-A14B:models_t5_umt5-xxl-enc-bf16.pth,Wan-AI/Wan2.2-T2V-A14B:Wan2.1_VAE.pth" \
+#   ${PINN_CHECKPOINT_ARG} \
+#   --learning_rate 1e-5 \
+#   --num_epochs 3 \
+#   --output_path "./models/train/pinn_plugin_low_noise" \
+#   --max_timestep_boundary 1 \
+#   --min_timestep_boundary 0.417 \
+#   --physics_weight 0.05 \
+#   --physics_warmup_steps 2000 \
+#   --save_steps 200 \
+#   --adapter_hidden_dim 64 \
+#   --moe_top_k "${MOE_TOP_K}" \
+#   ${MOE_FAST_MODE_FLAG} \
+#   --moe_pde_branches_per_sample "${MOE_PDE_BRANCHES_PER_SAMPLE}" \
+#   --moe_weight_threshold "${MOE_WEIGHT_THRESHOLD}" \
+#   --dataset_num_workers "${DATASET_NUM_WORKERS}" \
+#   --diagnostic_metrics_interval "${DIAGNOSTIC_METRICS_INTERVAL}" \
+#   --heartbeat_log_steps "${HEARTBEAT_LOG_STEPS}" \
+#   --tensorboard_log_steps 1 \
+#   --find_unused_parameters \
+#   ${EXTRA_FLAGS}
+
+
 accelerate launch \
   "${ACCELERATE_LAUNCH_ARGS[@]}" \
   examples/wanvideo/pinn_training/train_pinn.py \
   --dataset_base_path /home/dataset-assist-0/algorithm/cong.wang/cvpr/wisa-dataset/WISA-80K/data \
-  --dataset_metadata_path /home/dataset-assist-0/algorithm/cong.wang/cvpr/wisa-dataset/WISA-80K/data/metadata_new.csv \
+  --dataset_metadata_path /home/dataset-assist-0/algorithm/cong.wang/cvpr/wisa-dataset/WISA-80K/data/metadata_standard.csv \
   --height "${HEIGHT}" \
   --width "${WIDTH}" \
   --num_frames "${NUM_FRAMES}" \
@@ -94,8 +138,9 @@ accelerate launch \
   --output_path "./models/train/pinn_plugin_low_noise" \
   --max_timestep_boundary 1 \
   --min_timestep_boundary 0.417 \
-  --physics_weight 0.1 \
-  --physics_warmup_steps 500 \
+  --physics_weight 0.05 \
+  --physics_warmup_steps 2000 \
+  --save_steps 200 \
   --adapter_hidden_dim 64 \
   --moe_top_k "${MOE_TOP_K}" \
   ${MOE_FAST_MODE_FLAG} \

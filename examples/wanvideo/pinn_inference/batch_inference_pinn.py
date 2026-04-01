@@ -25,36 +25,20 @@ import torch
 from diffsynth import save_video
 from diffsynth.pipelines.wan_video_pinn import PhysicsInformedWanVideoPipeline
 from diffsynth.pipelines.wan_video_new import ModelConfig
+from auto_label_utils import (
+    PromptPhysicsLabelInferer,
+    build_minimal_label_metadata,
+    prompt_preview,
+)
 
 
 PHENOMENON_LABELS = [
-    "rigid body motion",
-    "collision",
-    "liquid motion",
-    "gas motion",
-    "elastic motion",
-    "deformation",
-    "melting",
-    "solidification",
-    "vaporization",
-    "liquefaction",
-    "combustion",
-    "explosion",
-    "reflection",
-    "refraction",
-    "scattering",
-    "interference and diffraction",
-    "unnatural light source",
+    # 10 physics-based categories aligned with Table 1
+    "Rigid Body", "Elastic", "Fluid", "Compressible Flow", "Phase Change",
+    "Collision/Contact", "Granular", "Fracture", "Thermal", "Optical",
 ]
 PHENOMENON_TO_ID = {name: idx for idx, name in enumerate(PHENOMENON_LABELS)}
-PHENOMENON_ALIAS = {
-    "liquid_motion": "liquid motion",
-    "rigid_body_motion": "rigid body motion",
-    "elastic_motion": "elastic motion",
-    "gas_motion": "gas motion",
-    "interference_and_diffraction": "interference and diffraction",
-    "unnatural_light_source": "unnatural light source",
-}
+PHENOMENON_ALIAS = {}
 
 
 def _safe_text(value):
@@ -78,9 +62,10 @@ def _parse_vector(text, cast_type=float):
 
 
 def _normalize_label(label):
-    clean = _safe_text(label).lower().replace("_", " ")
-    clean = re.sub(r"\s+", " ", clean)
-    return PHENOMENON_ALIAS.get(clean.replace(" ", "_"), clean)
+    """Normalize label: strip whitespace and standardize spacing."""
+    clean = _safe_text(label)
+    clean = re.sub(r"\s+", " ", clean).strip()
+    return clean
 
 
 def _hash_to_id(text, modulo):
@@ -124,7 +109,7 @@ def _encode_q_field(text, dim):
 def _is_encoded_metadata(metadata):
     if not isinstance(metadata, dict):
         return False
-    encoded_keys = {"label_id", "n_numeric", "n_text_ids", "q_vector"}
+    encoded_keys = {"label_id", "label_ids", "n_numeric", "n_text_ids", "q_vector"}
     return any(key in metadata for key in encoded_keys)
 
 
@@ -132,6 +117,8 @@ def _normalize_encoded_metadata(metadata):
     normalized = dict(metadata)
     if "label_id" in normalized and _safe_text(normalized["label_id"]) != "":
         normalized["label_id"] = int(normalized["label_id"])
+    if isinstance(normalized.get("label_ids"), str):
+        normalized["label_ids"] = _parse_vector(normalized.get("label_ids"), cast_type=int)
     if isinstance(normalized.get("n_numeric"), str):
         normalized["n_numeric"] = _parse_vector(normalized.get("n_numeric"), cast_type=float)
     if isinstance(normalized.get("n_text_ids"), str):
@@ -147,8 +134,22 @@ def encode_raw_metadata(raw_metadata, n_text_vocab_size=2048, q_dim=64):
     label_name = _normalize_label(raw_metadata.get("label", raw_metadata.get("label_name", "")))
     label_id = raw_metadata.get("label_id")
     if label_id is None or _safe_text(label_id) == "":
-        label_id = PHENOMENON_TO_ID.get(label_name, PHENOMENON_TO_ID["liquid motion"])
-    label_id = int(label_id)
+        label_ids = []
+        for part in label_name.split(","):
+            part = part.strip()
+            if part in PHENOMENON_TO_ID:
+                label_ids.append(PHENOMENON_TO_ID[part])
+        if not label_ids:
+            label_ids = [PHENOMENON_TO_ID["Fluid"]]
+        label_id = int(label_ids[0])
+    else:
+        if isinstance(label_id, str):
+            label_ids = [int(x.strip()) for x in label_id.split(",") if x.strip()]
+            if not label_ids:
+                label_ids = [PHENOMENON_TO_ID["Fluid"]]
+        else:
+            label_ids = [int(label_id)]
+        label_id = int(label_ids[0])
 
     n_raw_0 = raw_metadata.get("n0", raw_metadata.get("n1", ""))
     n_raw_1 = raw_metadata.get("n1", raw_metadata.get("n2", ""))
@@ -179,10 +180,25 @@ def encode_raw_metadata(raw_metadata, n_text_vocab_size=2048, q_dim=64):
     return {
         "label_name": label_name,
         "label_id": label_id,
+        "label_ids": label_ids,
         "n_numeric": n_numeric,
         "n_text_ids": n_text_ids,
         "q_vector": q_vector,
     }
+
+
+def extract_prompt_from_row(row):
+    if not isinstance(row, dict):
+        return ""
+    prompt = _safe_text(row.get("prompt", ""))
+    if prompt.startswith('"') and prompt.endswith('"'):
+        prompt = prompt[1:-1]
+    if prompt != "":
+        return prompt
+    caption = _safe_text(row.get("caption", ""))
+    if caption.startswith('"') and caption.endswith('"'):
+        caption = caption[1:-1]
+    return caption
 
 
 def metadata_from_row(row):
@@ -311,6 +327,17 @@ def main():
         default=None,
         help="Global metadata CSV path (raw or encoded); first row will be used.",
     )
+    parser.add_argument(
+        "--auto_label_from_prompt",
+        action="store_true",
+        help="Call an OpenAI-compatible LLM API to infer routing labels when row/global metadata is absent.",
+    )
+    parser.add_argument("--llm_model", type=str, default=None, help="LLM model name. Falls back to OPENAI_MODEL or LLM_MODEL.")
+    parser.add_argument("--llm_base_url", type=str, default=None, help="OpenAI-compatible base URL. Falls back to OPENAI_BASE_URL or LLM_BASE_URL.")
+    parser.add_argument("--llm_api_key", type=str, default=None, help="Optional direct API key. Prefer env vars for security.")
+    parser.add_argument("--llm_api_key_env", type=str, default="OPENAI_API_KEY", help="Environment variable name that stores the API key.")
+    parser.add_argument("--llm_timeout", type=float, default=30.0, help="LLM request timeout in seconds.")
+    parser.add_argument("--llm_max_retries", type=int, default=2, help="Maximum retry count for LLM requests.")
     parser.add_argument("--skip_existing", action="store_true", help="若输出文件已存在则跳过")
     parser.add_argument(
         "--resume",
@@ -391,6 +418,18 @@ def main():
     )
     if global_metadata is not None:
         print(f"  Using global PINN metadata (mode={global_mode}).")
+    llm_inferer = None
+    if args.auto_label_from_prompt:
+        llm_inferer = PromptPhysicsLabelInferer(
+            PHENOMENON_LABELS,
+            model=args.llm_model,
+            base_url=args.llm_base_url,
+            api_key=args.llm_api_key,
+            api_key_env=args.llm_api_key_env,
+            timeout=args.llm_timeout,
+            max_retries=args.llm_max_retries,
+            default_label="Fluid",
+        )
 
     ids_to_process: Iterable[int]
     if args.resume:
@@ -410,11 +449,7 @@ def main():
     for vid_id in ids_to_process:
         idx = vid_id - 1  # 0-based index
         row = rows[idx]
-        caption = row.get("caption", "").strip()
-        if caption.startswith('"') and caption.endswith('"'):
-            caption = caption[1:-1]
-        if caption == "":
-            caption = row.get("prompt", "").strip()
+        caption = extract_prompt_from_row(row)
         out_name = f"{vid_id:04d}.mp4"
         out_path = output_dir / out_name
 
@@ -427,9 +462,29 @@ def main():
         metadata_mode = global_mode
         if pinn_metadata is None:
             pinn_metadata, metadata_mode = metadata_from_row(row)
+        llm_result = None
+        if pinn_metadata is None and llm_inferer is not None:
+            llm_result = llm_inferer.infer(caption)
+            pinn_metadata = build_minimal_label_metadata(
+                llm_result["labels"],
+                PHENOMENON_TO_ID,
+                default_label="Fluid",
+            )
+            metadata_mode = "llm_auto_label"
         print(f"  [{vid_id:4d}/{total}] {caption[:60]}{'...' if len(caption) > 60 else ''} -> {out_name}")
         if pinn_metadata is not None:
             print(f"    metadata mode: {metadata_mode}")
+            print(
+                f"    routing labels: {pinn_metadata.get('label_ids')} "
+                f"({pinn_metadata.get('label_name', '')})"
+            )
+        if llm_result is not None:
+            print(
+                f"    llm prompt='{prompt_preview(caption)}', raw_labels={llm_result['raw_labels']}, "
+                f"final_labels={llm_result['labels']}, fallback={llm_result['fallback_used']}"
+            )
+            if llm_result.get("error"):
+                print(f"    llm warning: {llm_result['error']}")
 
         try:
             video = pipe(

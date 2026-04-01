@@ -16,3 +16,8 @@
 /videophy_test_public.csv
 /videophy_test_public_original.csv
 /train2.log
+/video_hunyuan
+/.pinn_api.env
+/examples/wanvideo/pinn_inference/__pycache__/
+/leet.py
+/output_videos_pinn_corrected/

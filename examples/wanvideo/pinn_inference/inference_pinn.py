@@ -21,36 +21,20 @@ sys.path.insert(0, str(project_root))
 from diffsynth import save_video
 from diffsynth.pipelines.wan_video_pinn import PhysicsInformedWanVideoPipeline
 from diffsynth.pipelines.wan_video_new import ModelConfig
+from auto_label_utils import (
+    PromptPhysicsLabelInferer,
+    build_minimal_label_metadata,
+    prompt_preview,
+)
 
 
 PHENOMENON_LABELS = [
-    "rigid body motion",
-    "collision",
-    "liquid motion",
-    "gas motion",
-    "elastic motion",
-    "deformation",
-    "melting",
-    "solidification",
-    "vaporization",
-    "liquefaction",
-    "combustion",
-    "explosion",
-    "reflection",
-    "refraction",
-    "scattering",
-    "interference and diffraction",
-    "unnatural light source",
+    # 10 physics-based categories aligned with Table 1
+    "Rigid Body", "Elastic", "Fluid", "Compressible Flow", "Phase Change",
+    "Collision/Contact", "Granular", "Fracture", "Thermal", "Optical",
 ]
 PHENOMENON_TO_ID = {name: idx for idx, name in enumerate(PHENOMENON_LABELS)}
-PHENOMENON_ALIAS = {
-    "liquid_motion": "liquid motion",
-    "rigid_body_motion": "rigid body motion",
-    "elastic_motion": "elastic motion",
-    "gas_motion": "gas motion",
-    "interference_and_diffraction": "interference and diffraction",
-    "unnatural_light_source": "unnatural light source",
-}
+PHENOMENON_ALIAS = {}
 
 
 def _parse_vector(text, cast_type=float):
@@ -74,9 +58,10 @@ def _safe_text(value):
 
 
 def _normalize_label(label):
-    clean = _safe_text(label).lower().replace("_", " ")
-    clean = re.sub(r"\s+", " ", clean)
-    return PHENOMENON_ALIAS.get(clean.replace(" ", "_"), clean)
+    """Normalize label: strip whitespace and standardize spacing."""
+    clean = _safe_text(label)
+    clean = re.sub(r"\s+", " ", clean).strip()
+    return clean
 
 
 def _hash_to_id(text, modulo):
@@ -120,7 +105,7 @@ def _encode_q_field(text, dim):
 def _is_encoded_metadata(metadata):
     if not isinstance(metadata, dict):
         return False
-    encoded_keys = {"label_id", "n_numeric", "n_text_ids", "q_vector"}
+    encoded_keys = {"label_id", "label_ids", "n_numeric", "n_text_ids", "q_vector"}
     return any(key in metadata for key in encoded_keys)
 
 
@@ -129,9 +114,27 @@ def encode_raw_metadata(raw_metadata, n_text_vocab_size=2048, q_dim=64):
         return None
     label_name = _normalize_label(raw_metadata.get("label", raw_metadata.get("label_name", "")))
     label_id = raw_metadata.get("label_id")
+
+    # 支持多标签解析（逗号分隔）
     if label_id is None:
-        label_id = PHENOMENON_TO_ID.get(label_name, PHENOMENON_TO_ID["liquid motion"])
-    label_id = int(label_id)
+        label_ids = []
+        for part in label_name.split(","):
+            part = part.strip()
+            if part in PHENOMENON_TO_ID:
+                label_ids.append(PHENOMENON_TO_ID[part])
+        if not label_ids:
+            label_ids = [PHENOMENON_TO_ID["Fluid"]]  # 默认标签
+        primary_label_id = label_ids[0]
+    else:
+        # 如果提供了 label_id，可能是单个值或逗号分隔的字符串
+        if isinstance(label_id, str):
+            label_ids = [int(x.strip()) for x in label_id.split(",") if x.strip()]
+            primary_label_id = label_ids[0]
+        else:
+            label_ids = [int(label_id)]
+            primary_label_id = int(label_id)
+
+    label_id = primary_label_id
 
     n_raw_0 = raw_metadata.get("n0", raw_metadata.get("n1", ""))
     n_raw_1 = raw_metadata.get("n1", raw_metadata.get("n2", ""))
@@ -162,6 +165,7 @@ def encode_raw_metadata(raw_metadata, n_text_vocab_size=2048, q_dim=64):
     encoded = {
         "label_name": label_name,
         "label_id": label_id,
+        "label_ids": label_ids,  # 多标签列表
         "n_numeric": n_numeric,
         "n_text_ids": n_text_ids,
         "q_vector": q_vector,
@@ -194,6 +198,8 @@ def load_inference_metadata(metadata_json=None, metadata_csv=None):
         metadata = dict(raw_or_encoded)
         if "label_id" in metadata:
             metadata["label_id"] = int(metadata["label_id"])
+        if isinstance(metadata.get("label_ids"), str):
+            metadata["label_ids"] = _parse_vector(metadata.get("label_ids"), cast_type=int)
         if isinstance(metadata.get("n_numeric"), str):
             metadata["n_numeric"] = _parse_vector(metadata.get("n_numeric"), cast_type=float)
         if isinstance(metadata.get("n_text_ids"), str):
@@ -235,6 +241,13 @@ def inference_pinn(
     attention_motion_percentile=90.0,
     metadata_json=None,
     metadata_csv=None,
+    auto_label_from_prompt=False,
+    llm_model=None,
+    llm_base_url=None,
+    llm_api_key=None,
+    llm_api_key_env="OPENAI_API_KEY",
+    llm_timeout=30.0,
+    llm_max_retries=2,
     # 设备参数
     device="cuda",
     torch_dtype=torch.bfloat16,
@@ -289,12 +302,39 @@ def inference_pinn(
         metadata_json=metadata_json,
         metadata_csv=metadata_csv,
     )
+    llm_result = None
+    if pinn_metadata is None and auto_label_from_prompt:
+        inferer = PromptPhysicsLabelInferer(
+            PHENOMENON_LABELS,
+            model=llm_model,
+            base_url=llm_base_url,
+            api_key=llm_api_key,
+            api_key_env=llm_api_key_env,
+            timeout=llm_timeout,
+            max_retries=llm_max_retries,
+            default_label="Fluid",
+        )
+        llm_result = inferer.infer(prompt)
+        pinn_metadata = build_minimal_label_metadata(
+            llm_result["labels"],
+            PHENOMENON_TO_ID,
+            default_label="Fluid",
+        )
+        metadata_mode = "llm_auto_label"
+        print(
+            "[3/4] Auto-labeled prompt via LLM: "
+            f"prompt='{prompt_preview(prompt)}', raw_labels={llm_result['raw_labels']}, "
+            f"final_labels={llm_result['labels']}, label_ids={pinn_metadata.get('label_ids')}, "
+            f"fallback={llm_result['fallback_used']}"
+        )
+        if llm_result.get("error"):
+            print(f"       LLM warning: {llm_result['error']}")
     if pinn_metadata is not None:
         print(f"[3/4] Using PINN metadata for MoE routing (mode={metadata_mode}).")
-        phenomenon = pinn_metadata.get("label_name", "liquid motion")
+        phenomenon = pinn_metadata.get("label_name", "Fluid")
     else:
         print(f"[3/4] No PINN metadata provided, using default phenomenon")
-        phenomenon = "liquid motion"
+        phenomenon = "Fluid"
 
     # 4. 生成视频（同时实时追踪每步的物理场 PDE 残差）
     print(f"\n[4/4] Generating video with real-time physics tracking...")
@@ -393,6 +433,17 @@ if __name__ == "__main__":
     )
     parser.add_argument("--metadata_json", type=str, default=None, help="Metadata JSON string or JSON file path")
     parser.add_argument("--metadata_csv", type=str, default=None, help="CSV file path with label_id/label_name/n_numeric/n_text_ids/q_vector")
+    parser.add_argument(
+        "--auto_label_from_prompt",
+        action="store_true",
+        help="Call an OpenAI-compatible LLM API to infer routing labels when metadata is absent.",
+    )
+    parser.add_argument("--llm_model", type=str, default=None, help="LLM model name. Falls back to OPENAI_MODEL or LLM_MODEL.")
+    parser.add_argument("--llm_base_url", type=str, default=None, help="OpenAI-compatible base URL. Falls back to OPENAI_BASE_URL or LLM_BASE_URL.")
+    parser.add_argument("--llm_api_key", type=str, default=None, help="Optional direct API key. Prefer env vars for security.")
+    parser.add_argument("--llm_api_key_env", type=str, default="OPENAI_API_KEY", help="Environment variable name that stores the API key.")
+    parser.add_argument("--llm_timeout", type=float, default=30.0, help="LLM request timeout in seconds.")
+    parser.add_argument("--llm_max_retries", type=int, default=2, help="Maximum retry count for LLM requests.")
     
     # 设备参数
     parser.add_argument("--device", type=str, default="cuda", help="Device")
@@ -420,5 +471,12 @@ if __name__ == "__main__":
         attention_motion_percentile=args.attention_motion_percentile,
         metadata_json=args.metadata_json,
         metadata_csv=args.metadata_csv,
+        auto_label_from_prompt=args.auto_label_from_prompt,
+        llm_model=args.llm_model,
+        llm_base_url=args.llm_base_url,
+        llm_api_key=args.llm_api_key,
+        llm_api_key_env=args.llm_api_key_env,
+        llm_timeout=args.llm_timeout,
+        llm_max_retries=args.llm_max_retries,
         device=args.device,
     )

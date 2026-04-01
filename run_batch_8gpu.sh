@@ -11,6 +11,9 @@
 #   CSV=xxx.csv          CSV 路径
 #   OUTPUT_DIR=xxx       输出目录（默认 output_videos）
 #   CHECKPOINT=xxx.pt    PINN checkpoint
+#   OPENAI_API_KEY=...   OpenAI-compatible API key
+#   OPENAI_BASE_URL=...  OpenAI-compatible base URL
+#   OPENAI_MODEL=...     LLM model used for routing labels
 #   LOG_DIR=logs         若设置，每卡输出到 logs/gpu0.log 等
 #
 # 单独跑某张卡（例如卡 0，ID 1-421）:
@@ -21,11 +24,18 @@
 set -e
 cd "$(dirname "$0")"
 
+if [[ -f ".pinn_api.env" ]]; then
+    set -a
+    source ".pinn_api.env"
+    set +a
+fi
+
 CSV="${CSV:-videophy_test_public.csv}"
-OUTPUT_DIR="${OUTPUT_DIR:-output_videos}"
+OUTPUT_DIR="${OUTPUT_DIR:-output_videos_pinn_corrected}"
 CHECKPOINT="${CHECKPOINT:-models/train/pinn_plugin_low_noise/pinn_plugin_final.pt}"
 LOG_DIR="${LOG_DIR:-}"
 TOTAL=344
+AUTO_LABEL_FROM_PROMPT="${AUTO_LABEL_FROM_PROMPT:-1}"
 
 # 每卡约 420 个，均匀分配
 CHUNK=$(( (TOTAL + 7) / 8 ))
@@ -35,7 +45,11 @@ run_one() {
     shift 3
     echo "[GPU $gpu] Starting: IDs $start - $end"
     local log_redirect=""
+    local auto_label_flag=""
     [[ -n "$LOG_DIR" ]] && { mkdir -p "$LOG_DIR"; log_redirect="2>&1 | tee $LOG_DIR/gpu${gpu}.log"; }
+    if [[ "$AUTO_LABEL_FROM_PROMPT" == "1" ]]; then
+        auto_label_flag="--auto_label_from_prompt"
+    fi
     eval "CUDA_VISIBLE_DEVICES=$gpu python examples/wanvideo/pinn_inference/batch_inference_pinn.py \
         --csv \"$CSV\" \
         --start_id $start \
@@ -43,6 +57,7 @@ run_one() {
         --output_dir \"$OUTPUT_DIR\" \
         --checkpoint_path \"$CHECKPOINT\" \
         --skip_existing \
+        $auto_label_flag \
         \"\$@\" $log_redirect"
 }
 

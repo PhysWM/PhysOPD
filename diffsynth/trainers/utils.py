@@ -435,6 +435,9 @@ def launch_training_task(
     tensorboard_dir: str = None,
     tensorboard_log_steps: int = 10,
     heartbeat_log_steps: int = 1,
+    resume_step: int = 0,
+    resume_epoch: int = 0,
+    checkpoint_training_state: dict = None,
 ):
     if len(dataset) == 0:
         raise ValueError("Dataset is empty. Please verify metadata and dataset paths.")
@@ -457,6 +460,22 @@ def launch_training_task(
         kwargs_handlers=kwargs_handlers,
     )
     model, optimizer, dataloader, scheduler = accelerator.prepare(model, optimizer, dataloader, scheduler)
+
+    # 在 accelerator.prepare 之后加载训练状态
+    # 注意：DeepSpeed ZeRO optimizer state 恢复比较复杂，这里跳过 optimizer state
+    # 只恢复 scheduler state（如果需要的话）
+    if checkpoint_training_state is not None:
+        # 跳过 optimizer state 恢复（DeepSpeed ZeRO 的 state 是分片的，恢复比较复杂）
+        # optimizer 会从头开始，但这对训练影响不大
+        if 'scheduler_state_dict' in checkpoint_training_state and checkpoint_training_state['scheduler_state_dict'] is not None:
+            try:
+                scheduler.load_state_dict(checkpoint_training_state['scheduler_state_dict'])
+                if accelerator.is_main_process:
+                    print(f"Loaded scheduler state from checkpoint")
+            except Exception as e:
+                if accelerator.is_main_process:
+                    print(f"Warning: Failed to load scheduler state: {e}")
+
     unwrapped_model = accelerator.unwrap_model(model)
     writer = None
     if accelerator.is_main_process and tensorboard_dir:
@@ -473,13 +492,24 @@ def launch_training_task(
             raise RuntimeError(
                 f"Inconsistent dataloader lengths across ranks: {gathered_num_batches.tolist()}"
             )
-    
+
     heartbeat_interval = max(int(heartbeat_log_steps), 1)
     last_step_end_time = time.perf_counter()
 
-    for epoch_id in range(num_epochs):
+    # 从恢复的 epoch 开始训练
+    start_epoch = resume_epoch
+    global_step_offset = resume_step
+
+    for epoch_id in range(start_epoch, num_epochs):
         progress_bar = tqdm(dataloader, disable=not accelerator.is_local_main_process)
         for step_id, data in enumerate(progress_bar, start=1):
+            # 计算当前的全局 step
+            current_global_step = global_step_offset + step_id
+
+            # 如果是恢复的 epoch 且 step_id 小于 resume_step 对应的 epoch 内的 step，跳过
+            if epoch_id == start_epoch and current_global_step <= resume_step:
+                continue
+
             step_ready_time = time.perf_counter()
             data_wait_s = step_ready_time - last_step_end_time
             if data is None:
@@ -498,11 +528,37 @@ def launch_training_task(
             with accelerator.accumulate(model):
                 optimizer.zero_grad()
                 loss = model(data)
-                accelerator.backward(loss)
-                optimizer.step()
+
+                # NaN/Inf detection and protection - SKIP backward if invalid
+                if torch.isnan(loss) or torch.isinf(loss):
+                    print(f"[WARNING] NaN/Inf detected in loss at step {model_logger.num_steps}, skipping this step")
+                    loss_value = 0.0
+                    # Skip backward pass entirely
+                else:
+                    accelerator.backward(loss)
+
+                    # Gradient clipping to prevent explosion (tightened for PINN stability)
+                    if hasattr(accelerator, 'clip_grad_norm_'):
+                        accelerator.clip_grad_norm_(model.parameters(), max_norm=0.5)
+                    else:
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
+
+                    optimizer.step()
+
+                    # Clamp PINN parameters if they exist
+                    if hasattr(model, 'pde_residuals') and hasattr(model.pde_residuals, '_clamp_parameters'):
+                        model.pde_residuals._clamp_parameters()
+
+                    loss_value = float(loss.detach().item())
+
+                # 保存训练状态到 logger（用于 checkpoint）
+                if hasattr(model_logger, 'save_training_state'):
+                    model_logger.save_training_state(optimizer, scheduler, current_global_step, epoch_id)
+
                 model_logger.on_step_end(accelerator, model, save_steps)
                 scheduler.step()
-                loss_value = float(loss.detach().item())
+
+
                 if writer is not None and model_logger.num_steps % max(int(tensorboard_log_steps), 1) == 0:
                     global_step = model_logger.num_steps
                     writer.add_scalar("train/loss", loss_value, global_step)
@@ -542,7 +598,13 @@ def launch_training_task(
                         )
             last_step_end_time = time.perf_counter()
         if save_steps is None:
-            model_logger.on_epoch_end(accelerator, model, epoch_id)
+            # 在 epoch 结束时保存，包含训练状态
+            if hasattr(model_logger, 'save_training_state'):
+                model_logger.save_training_state(optimizer, scheduler, current_global_step, epoch_id)
+            if hasattr(model_logger, 'save_model'):
+                model_logger.save_model(accelerator, model, f"pinn_plugin_epoch-{epoch_id}.pt", save_training_state=True)
+            else:
+                model_logger.on_epoch_end(accelerator, model, epoch_id)
         if writer is not None:
             writer.flush()
     model_logger.on_training_end(accelerator, model, save_steps)

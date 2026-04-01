@@ -31,51 +31,31 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 
 PHENOMENON_LABELS = [
-    "rigid body motion",
-    "collision",
-    "liquid motion",
-    "gas motion",
-    "elastic motion",
-    "deformation",
-    "melting",
-    "solidification",
-    "vaporization",
-    "liquefaction",
-    "combustion",
-    "explosion",
-    "reflection",
-    "refraction",
-    "scattering",
-    "interference and diffraction",
-    "unnatural light source",
+    # 10 physics-based categories aligned with Table 1
+    "Rigid Body",           # 1. strain minimization + smoothness
+    "Elastic",              # 2. wave dynamics + strain
+    "Fluid",                # 3. continuity + viscosity + vorticity
+    "Compressible Flow",    # 4. mass conservation + dynamics
+    "Phase Change",         # 5. expansion + latent heat effects
+    "Collision/Contact",    # 6. momentum exchange + acceleration
+    "Granular",             # 7. friction + inertial effects
+    "Fracture",             # 8. energy release + crack dynamics
+    "Thermal",              # 9. energy diffusion (temperature field)
+    "Optical",              # 10. wave propagation + interference
 ]
 PHENOMENON_TO_ID = {name: idx for idx, name in enumerate(PHENOMENON_LABELS)}
-PHENOMENON_ALIAS = {
-    "liquid_motion": "liquid motion",
-    "rigid_body_motion": "rigid body motion",
-    "elastic_motion": "elastic motion",
-    "gas_motion": "gas motion",
-    "interference_and_diffraction": "interference and diffraction",
-    "unnatural_light_source": "unnatural light source",
-}
+PHENOMENON_ALIAS = {}
 PHENOMENON_TO_RESIDUAL_METHOD = {
-    "rigid body motion": "rigid_body_motion_residual",
-    "collision": "collision_residual",
-    "liquid motion": "liquid_motion_residual",
-    "gas motion": "gas_motion_residual",
-    "elastic motion": "elastic_motion_residual",
-    "deformation": "deformation_residual",
-    "melting": "melting_residual",
-    "solidification": "solidification_residual",
-    "vaporization": "vaporization_residual",
-    "liquefaction": "liquefaction_residual",
-    "combustion": "combustion_residual",
-    "explosion": "explosion_residual",
-    "reflection": "reflection_residual",
-    "refraction": "refraction_residual",
-    "scattering": "scattering_residual",
-    "interference and diffraction": "interference_diffraction_residual",
-    "unnatural light source": "unnatural_light_source_residual",
+    "Rigid Body": "rigid_body_residual",
+    "Elastic": "elastic_residual",
+    "Fluid": "fluid_residual",
+    "Compressible Flow": "compressible_flow_residual",
+    "Phase Change": "phase_change_residual",
+    "Collision/Contact": "collision_contact_residual",
+    "Granular": "granular_residual",
+    "Fracture": "fracture_residual",
+    "Thermal": "thermal_residual",
+    "Optical": "optical_residual",
 }
 
 
@@ -191,8 +171,9 @@ class WanPINNTrainingModule(DiffusionTrainingModule):
         self.pde_residuals.requires_grad_(True)
 
         # 加载 PINN checkpoint（如果有）
+        self._checkpoint_training_state = None  # 存储训练状态用于后续恢复
         if pinn_checkpoint is not None:
-            checkpoint = torch.load(pinn_checkpoint, map_location="cpu")
+            checkpoint = torch.load(pinn_checkpoint, map_location="cpu", weights_only=False)
             if 'physics_adapter_state_dict' in checkpoint:
                 load_result = self.physics_adapter.load_state_dict(
                     checkpoint['physics_adapter_state_dict'], strict=False
@@ -211,6 +192,12 @@ class WanPINNTrainingModule(DiffusionTrainingModule):
                     print(f"PDE missing keys: {load_result.missing_keys[:5]}...")
                 if len(load_result.unexpected_keys) > 0:
                     print(f"PDE unexpected keys: {load_result.unexpected_keys[:5]}...")
+            # 加载训练状态（如果有）
+            if 'training_state' in checkpoint:
+                self._checkpoint_training_state = checkpoint['training_state']
+                print(f"Found training state in checkpoint: step={self._checkpoint_training_state.get('current_step', 0)}, epoch={self._checkpoint_training_state.get('current_epoch', 0)}")
+
+        # 统计可训练参数
         
         # 统计可训练参数
         trainable_params = sum(
@@ -312,9 +299,11 @@ class WanPINNTrainingModule(DiffusionTrainingModule):
 
     @staticmethod
     def _normalize_label(label):
-        clean = WanPINNTrainingModule._safe_text(label).lower().replace("_", " ")
-        clean = re.sub(r"\s+", " ", clean)
-        return PHENOMENON_ALIAS.get(clean.replace(" ", "_"), clean)
+        """Normalize label: strip whitespace and standardize spacing."""
+        clean = WanPINNTrainingModule._safe_text(label)
+        # Remove extra whitespace but preserve original case
+        clean = re.sub(r"\s+", " ", clean).strip()
+        return clean
 
     @staticmethod
     def _hash_to_id(text, modulo):
@@ -419,13 +408,26 @@ class WanPINNTrainingModule(DiffusionTrainingModule):
         }
 
     def extract_physics_metadata(self, data, batch_size, device, dtype):
-        """从 CSV metadata 提取并编码 PINN 条件输入，缺失字段时自动回退"""
+        """从 CSV metadata 提取并编码 PINN 条件输入，缺失字段时自动回退，支持多标签"""
         if not isinstance(data, dict):
             return None
 
+        # 支持多标签解析（逗号分隔）
         label_name = self._normalize_label(data.get("label", ""))
-        label_id = PHENOMENON_TO_ID.get(label_name, PHENOMENON_TO_ID["liquid motion"])
-        label_ids = torch.full((batch_size,), label_id, dtype=torch.long, device=device)
+        label_ids_list = []
+        for part in label_name.split(","):
+            part = part.strip()
+            if part in PHENOMENON_TO_ID:
+                label_ids_list.append(PHENOMENON_TO_ID[part])
+
+        if not label_ids_list:
+            # 没有有效标签时，使用默认标签
+            label_ids_list = [PHENOMENON_TO_ID["Fluid"]]
+
+        primary_label_id = label_ids_list[0]  # 主标签（向后兼容）
+
+        # 主标签用于单个标签的场景
+        label_ids_tensor = torch.full((batch_size,), primary_label_id, dtype=torch.long, device=device)
 
         n_numeric_list = []
         valid_count = 0.0
@@ -465,7 +467,8 @@ class WanPINNTrainingModule(DiffusionTrainingModule):
 
         return {
             "label_name": label_name,
-            "label_id": label_ids,
+            "label_id": label_ids_tensor,  # 主标签（向后兼容）
+            "label_ids": label_ids_list,   # 多标签列表（用于多标签路由）
             "n_numeric": n_numeric.to(dtype=dtype),
             "n_text_ids": n_text_ids,
             "q_vector": q_vector.to(dtype=dtype),
@@ -498,6 +501,10 @@ class WanPINNTrainingModule(DiffusionTrainingModule):
 
     def compute_physics_loss(self, v_pred, z_t, label_name, metadata=None):
         """计算 PDE 残差损失 - 使用现象直接路由"""
+        # Aggressive clamping at entry point
+        v_pred = torch.clamp(v_pred, min=-10.0, max=10.0)
+        z_t = torch.clamp(z_t, min=-10.0, max=10.0)
+
         pde_metadata = None if self.ablate_disable_conditioned_pde else metadata
         phenomenon_name = label_name.lower() if isinstance(label_name, str) else ""
         residual_method_name = PHENOMENON_TO_RESIDUAL_METHOD.get(phenomenon_name)
@@ -505,9 +512,16 @@ class WanPINNTrainingModule(DiffusionTrainingModule):
             residual_method = getattr(self.pde_residuals, residual_method_name)
             loss, info = residual_method(z_t, v_pred, metadata=pde_metadata)
         else:
-            # If phenomenon not found, use a default (e.g., liquid motion)
-            default_residual = getattr(self.pde_residuals, "liquid_motion_residual")
+            # If phenomenon not found, use a default (e.g., Fluid)
+            default_residual = getattr(self.pde_residuals, "fluid_residual")
             loss, info = default_residual(z_t, v_pred, metadata=pde_metadata)
+
+        # NaN 保护：确保 loss 不是 NaN/Inf，并裁剪到合理范围
+        if torch.isnan(loss) or torch.isinf(loss):
+            print(f"[WARNING] NaN/Inf in physics loss for {phenomenon_name}, replacing with 0")
+            loss = torch.zeros_like(loss)
+        else:
+            loss = torch.clamp(loss, min=0.0, max=100.0)
 
         info = dict(info)
         info.update(self._motion_mask_stats_from_metadata(pde_metadata))
@@ -526,6 +540,11 @@ class WanPINNTrainingModule(DiffusionTrainingModule):
                     v_pred.detach(),
                     metadata=unmasked_metadata,
                 )
+                # Clamp unmasked_loss to prevent division issues
+                if torch.isnan(unmasked_loss) or torch.isinf(unmasked_loss):
+                    unmasked_loss = torch.tensor(1e-6, device=loss.device, dtype=loss.dtype)
+                else:
+                    unmasked_loss = torch.clamp(unmasked_loss, min=1e-8, max=100.0)
             info["masked_vs_unmasked_residual_ratio"] = float(
                 (loss.detach() / (unmasked_loss.detach() + 1e-8)).item()
             )
@@ -637,6 +656,9 @@ class WanPINNTrainingModule(DiffusionTrainingModule):
                 )
                 residual_method = getattr(self.pde_residuals, residual_method_name)
                 expert_loss, expert_info = residual_method(z_sample, branch_v, metadata=branch_metadata)
+                # NaN 保护：确保 expert_loss 不是 NaN/Inf
+                if torch.isnan(expert_loss) or torch.isinf(expert_loss):
+                    expert_loss = torch.zeros_like(expert_loss)
                 total_loss = total_loss + expert_weight * expert_loss
                 if collect_diagnostics:
                     expert_info = dict(expert_info)
@@ -861,6 +883,8 @@ class WanPINNTrainingModule(DiffusionTrainingModule):
         filtered = {}
         if "label_id" in metadata:
             filtered["label_id"] = metadata["label_id"]
+        if "label_ids" in metadata:
+            filtered["label_ids"] = metadata["label_ids"]
         if "label_name" in metadata:
             filtered["label_name"] = metadata["label_name"]
         # 保留 parse ratio 用于稳定训练时的缩放
@@ -946,7 +970,13 @@ class WanPINNTrainingModule(DiffusionTrainingModule):
         
         # FM 的训练目标（速度场真值）
         v_target = self.pipe.scheduler.training_target(input_latents, noise, timestep)
-        
+
+        # Clamp v_target to prevent numerical issues
+        v_target = torch.clamp(v_target, min=-10.0, max=10.0)
+        if torch.isnan(v_target).any() or torch.isinf(v_target).any():
+            print(f"[WARNING] NaN/Inf detected in v_target at step {self.current_step}, replacing with zeros")
+            v_target = torch.zeros_like(v_target)
+
         with torch.no_grad():
             v_original = self.pipe.model_fn(
                 **models,
@@ -958,6 +988,12 @@ class WanPINNTrainingModule(DiffusionTrainingModule):
                 use_gradient_checkpointing=self.frozen_model_gradient_checkpointing,
                 use_gradient_checkpointing_offload=self.use_gradient_checkpointing_offload,
             )
+
+        # Aggressive clamping immediately after v_original computation
+        v_original = torch.clamp(v_original, min=-10.0, max=10.0)
+        if torch.isnan(v_original).any() or torch.isinf(v_original).any():
+            print(f"[WARNING] NaN/Inf detected in v_original at step {self.current_step}, replacing with zeros")
+            v_original = torch.zeros_like(v_original)
 
         metadata = self.extract_physics_metadata(
             data=data,
@@ -975,7 +1011,7 @@ class WanPINNTrainingModule(DiffusionTrainingModule):
         motion_mask_metrics = self._collect_motion_mask_metrics(motion_mask)
 
         # Extract phenomenon label for logging
-        phenomenon = metadata.get("label_name", "liquid motion") if isinstance(metadata, dict) else "liquid motion"
+        phenomenon = metadata.get("label_name", "Fluid") if isinstance(metadata, dict) else "Fluid"
 
         adapter_metadata = metadata
         if self.ablate_disable_moe:
@@ -987,6 +1023,13 @@ class WanPINNTrainingModule(DiffusionTrainingModule):
         # 2. PhysicsAdapter 施加物理校正（trainable, has grad）
         # ============================================================
         v_corrected = self.physics_adapter(v_original, z_t, metadata=adapter_metadata)
+
+        # Aggressive clamping immediately after v_corrected computation
+        v_corrected = torch.clamp(v_corrected, min=-10.0, max=10.0)
+        if torch.isnan(v_corrected).any() or torch.isinf(v_corrected).any():
+            print(f"[WARNING] NaN/Inf detected in v_corrected at step {self.current_step}, replacing with v_original")
+            v_corrected = v_original.clone()
+
         
         # ============================================================
         # 3. 计算损失（全部来自可训练参数，确保有 grad_fn）
@@ -1016,7 +1059,7 @@ class WanPINNTrainingModule(DiffusionTrainingModule):
             )
         else:
             # Get phenomenon label from metadata
-            label_name = metadata.get("label_name", "liquid motion") if isinstance(metadata, dict) else "liquid motion"
+            label_name = metadata.get("label_name", "Fluid") if isinstance(metadata, dict) else "Fluid"
             loss_physics, physics_info = self.compute_physics_loss(
                 v_corrected, z_t, label_name, metadata=pde_metadata
             )
@@ -1026,25 +1069,48 @@ class WanPINNTrainingModule(DiffusionTrainingModule):
             parse_ratio = float(metadata["parse_success_ratio"].detach().item())
         conditioned_scale = 0.5 + 0.5 * cond_alpha * parse_ratio
         loss_physics = loss_physics * conditioned_scale
+
+        # NaN 保护：如果 physics loss 是 NaN/Inf，则替换为 0
+        if torch.isnan(loss_physics) or torch.isinf(loss_physics):
+            loss_physics = torch.zeros_like(loss_physics)
         loss_physics_value = float(loss_physics.detach().item())
         
         # (b) 适配器校正不应偏离原始输出太多（正则化）
         correction = v_corrected - v_original
         loss_reg = torch.mean(correction ** 2)
-        
+        # Clamp to prevent overflow
+        loss_reg = torch.clamp(loss_reg, min=0.0, max=100.0)
+        if torch.isnan(loss_reg) or torch.isinf(loss_reg):
+            loss_reg = torch.tensor(0.0, device=loss_reg.device, dtype=loss_reg.dtype)
+
         # (c) 校正后的速度场应仍然接近 FM 训练目标（保持生成质量）
         loss_fm_adapter = torch.nn.functional.mse_loss(
             v_corrected.float(), v_target.float()
         )
+        loss_fm_adapter = torch.clamp(loss_fm_adapter, min=0.0, max=100.0)
+        if torch.isnan(loss_fm_adapter) or torch.isinf(loss_fm_adapter):
+            loss_fm_adapter = torch.tensor(0.0, device=loss_fm_adapter.device, dtype=loss_fm_adapter.dtype)
 
         aux_losses = self.physics_adapter.compute_auxiliary_losses()
         loss_expert_balance = aux_losses["expert_balance"]
         loss_condition_consistency = aux_losses["condition_consistency"]
+
+        # Clamp auxiliary losses
+        loss_expert_balance = torch.clamp(loss_expert_balance, min=0.0, max=100.0)
+        if torch.isnan(loss_expert_balance) or torch.isinf(loss_expert_balance):
+            loss_expert_balance = torch.tensor(0.0, device=loss_expert_balance.device, dtype=loss_expert_balance.dtype)
+
+        loss_condition_consistency = torch.clamp(loss_condition_consistency, min=0.0, max=100.0)
+        if torch.isnan(loss_condition_consistency) or torch.isinf(loss_condition_consistency):
+            loss_condition_consistency = torch.tensor(0.0, device=loss_condition_consistency.device, dtype=loss_condition_consistency.dtype)
+
         if self.ablate_disable_aux_losses:
             loss_expert_balance = loss_expert_balance * 0.0
             loss_condition_consistency = loss_condition_consistency * 0.0
-        
+            loss_reg = loss_reg * 0.0  # 也禁用正则化损失
+
         # 总损失：全部通过 physics_adapter，有完整的计算图
+        # 当 ablate_disable_aux_losses=True 时，只使用 loss_fm_adapter + loss_physics
         total_loss = (
             loss_fm_adapter
             + physics_weight * loss_physics
@@ -1052,6 +1118,11 @@ class WanPINNTrainingModule(DiffusionTrainingModule):
             + self.expert_balance_weight * loss_expert_balance
             + self.condition_consistency_weight * loss_condition_consistency
         )
+
+        # NaN 保护：如果 total_loss 是 NaN/Inf，返回一个小的 dummy loss
+        if torch.isnan(total_loss) or torch.isinf(total_loss):
+            print(f"[WARNING] NaN/Inf detected in total_loss at step {self.current_step}, using dummy loss")
+            total_loss = torch.zeros_like(total_loss, requires_grad=True) + 1e-8
         router_metrics, expert_residual_metrics, decoded_branch_metrics = {}, {}, {}
         if collect_diagnostics:
             router_metrics = self._collect_router_metrics(loss_physics_value)
@@ -1093,36 +1164,67 @@ class PINNModelLogger(ModelLogger):
     """
     PINN 专用的模型保存器
     只保存 PINN 插件参数（不保存原模型参数）
+    支持保存和恢复优化器、调度器状态
     """
-    
+
     def __init__(self, output_path, remove_prefix_in_ckpt=None, state_dict_converter=lambda x: x):
         super().__init__(output_path, remove_prefix_in_ckpt, state_dict_converter)
-    
-    def save_model(self, accelerator, model, file_name):
-        """只保存 PINN 插件参数"""
+        self.optimizer_state = None
+        self.scheduler_state = None
+        self.current_step = 0
+        self.current_epoch = 0
+
+    def save_training_state(self, optimizer, scheduler, step, epoch):
+        """保存优化器和调度器状态（在保存checkpoint前调用）"""
+        self.optimizer_state = optimizer.state_dict() if optimizer is not None else None
+        self.scheduler_state = scheduler.state_dict() if scheduler is not None else None
+        self.current_step = step
+        self.current_epoch = epoch
+
+    def save_model(self, accelerator, model, file_name, save_training_state=False):
+        """只保存 PINN 插件参数，可选保存训练状态"""
         accelerator.wait_for_everyone()
+        # Use accelerator.get_state_dict to properly gather from all processes
+        # This ensures DDP-synchronized weights are saved correctly
+        state_dict = accelerator.get_state_dict(model)
+
         if accelerator.is_main_process:
             unwrapped_model = accelerator.unwrap_model(model)
 
             physics_adapter_state_dict = {}
             pde_residuals_state_dict = {}
             if hasattr(unwrapped_model, 'physics_adapter'):
+                # Use the gathered state_dict instead of directly accessing the model
+                prefix = 'physics_adapter.'
                 physics_adapter_state_dict = {
-                    k: v.detach().cpu()
-                    for k, v in unwrapped_model.physics_adapter.state_dict().items()
+                    k[len(prefix):]: v.detach().cpu().float()  # Convert to float32 for stability
+                    for k, v in state_dict.items()
+                    if k.startswith(prefix)
                 }
             if hasattr(unwrapped_model, 'pde_residuals'):
+                prefix = 'pde_residuals.'
                 pde_residuals_state_dict = {
-                    k: v.detach().cpu()
-                    for k, v in unwrapped_model.pde_residuals.state_dict().items()
+                    k[len(prefix):]: v.detach().cpu().float()  # Convert to float32 for stability
+                    for k, v in state_dict.items()
+                    if k.startswith(prefix)
                 }
-            
+
+            # Check for NaN values in the state dict
+            has_nan = any(
+                torch.isnan(v).any().item()
+                for v in list(physics_adapter_state_dict.values()) + list(pde_residuals_state_dict.values())
+                if isinstance(v, torch.Tensor)
+            )
+            if has_nan:
+                print(f"  WARNING: NaN detected in checkpoint! Skipping save.")
+                return
+
             os.makedirs(self.output_path, exist_ok=True)
             path = os.path.join(self.output_path, file_name)
-            
+
             # 保存为 .pt 格式（包含额外元信息）
             pt_path = path.replace(".safetensors", ".pt")
-            torch.save({
+            checkpoint = {
                 'physics_adapter_state_dict': physics_adapter_state_dict,
                 'pde_residuals_state_dict': pde_residuals_state_dict,
                 'config': {
@@ -1175,14 +1277,41 @@ class PINNModelLogger(ModelLogger):
                         ),
                     },
                 },
-            }, pt_path)
+            }
+
+            # 可选保存训练状态
+            if save_training_state:
+                checkpoint['training_state'] = {
+                    'optimizer_state_dict': self.optimizer_state,
+                    'scheduler_state_dict': self.scheduler_state,
+                    'current_step': self.current_step,
+                    'current_epoch': self.current_epoch,
+                }
+
+            torch.save(checkpoint, pt_path)
             print(f"PINN plugin saved to: {pt_path}")
             print(f"  Total keys: {len(physics_adapter_state_dict) + len(pde_residuals_state_dict)}")
-    
+            if save_training_state:
+                print(f"  Training state: step={self.current_step}, epoch={self.current_epoch}")
+
+    def on_step_end(self, accelerator, model, save_steps=None):
+        """每个 step 结束，支持 save_steps 保存中间 checkpoint（包含训练状态）"""
+        self.num_steps += 1
+        if save_steps is not None and self.num_steps % save_steps == 0:
+            self.save_model(accelerator, model, f"step-{self.num_steps}.pt", save_training_state=True)
+
+    def on_epoch_end(self, accelerator, model, epoch_id):
+        """每个 epoch 结束保存（包含训练状态）"""
+        self.save_model(accelerator, model, f"pinn_plugin_epoch-{epoch_id}.pt", save_training_state=True)
+
+    def on_training_end(self, accelerator, model, save_steps=None):
+        """训练结束保存最终模型"""
+        self.save_model(accelerator, model, "pinn_plugin_final.pt")
+
     def on_epoch_end(self, accelerator, model, epoch_id):
         """每个 epoch 结束保存"""
         self.save_model(accelerator, model, f"pinn_plugin_epoch-{epoch_id}.pt")
-    
+
     def on_training_end(self, accelerator, model, save_steps=None):
         """训练结束保存最终模型"""
         self.save_model(accelerator, model, "pinn_plugin_final.pt")
@@ -1331,7 +1460,7 @@ if __name__ == "__main__":
         args.output_path,
         remove_prefix_in_ckpt=args.remove_prefix_in_ckpt,
     )
-    
+
     # 优化器：只优化 PINN 可训练参数
     optimizer = torch.optim.AdamW(
         model.trainable_modules(),
@@ -1339,7 +1468,19 @@ if __name__ == "__main__":
         weight_decay=args.weight_decay,
     )
     scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer)
-    
+
+    # 从 checkpoint 恢复训练状态（如果有）
+    resume_step = 0
+    resume_epoch = 0
+    checkpoint_training_state = None
+    if hasattr(model, '_checkpoint_training_state') and model._checkpoint_training_state is not None:
+        checkpoint_training_state = model._checkpoint_training_state
+        resume_step = checkpoint_training_state.get('current_step', 0)
+        resume_epoch = checkpoint_training_state.get('current_epoch', 0)
+        print(f"Will resume training from step={resume_step}, epoch={resume_epoch}")
+        # 更新 model 的 current_step
+        model.current_step = resume_step
+
     # 启动多卡训练
     tensorboard_dir = args.tensorboard_dir or os.path.join(args.output_path, "tb")
     launch_training_task(
@@ -1353,4 +1494,7 @@ if __name__ == "__main__":
         tensorboard_dir=tensorboard_dir,
         tensorboard_log_steps=args.tensorboard_log_steps,
         heartbeat_log_steps=args.heartbeat_log_steps,
+        resume_step=resume_step,
+        resume_epoch=resume_epoch,
+        checkpoint_training_state=checkpoint_training_state,
     )
