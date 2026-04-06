@@ -25,4 +25,9 @@ accelerate launch \
   --physics_weight 0.1 \
   --physics_warmup_steps 500 \
   --adapter_hidden_dim 64 \
+  --physics_state_mode x0_hat \
+  --use_sigma_gate \
+  --sigma_gate_curve quadratic \
+  --use_sigma_conditioning \
+  --sigma_gate_floor 0.05 \
   --find_unused_parameters

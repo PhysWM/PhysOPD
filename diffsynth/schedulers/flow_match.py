@@ -95,6 +95,36 @@ class FlowMatchScheduler():
         return sample
     
 
+    def sigma_from_timestep(self, timestep, device=None, dtype=None):
+        if isinstance(timestep, torch.Tensor):
+            timestep_device = timestep.device if device is None else device
+            timestep_dtype = timestep.dtype if dtype is None else dtype
+            timesteps = timestep.detach().to(self.timesteps.device).reshape(-1)
+            sigma_device = self.sigmas.device
+            timestep_ids = torch.argmin(
+                (self.timesteps.to(sigma_device).unsqueeze(0) - timesteps.unsqueeze(1)).abs(),
+                dim=1,
+            )
+            sigma = self.sigmas.to(device=timestep_device, dtype=timestep_dtype)[timestep_ids]
+            return sigma.reshape(timestep.shape)
+        timestep_id = torch.argmin((self.timesteps - timestep).abs())
+        sigma = self.sigmas[timestep_id]
+        if device is not None or dtype is not None:
+            sigma = sigma.to(device=device or sigma.device, dtype=dtype or sigma.dtype)
+        return sigma
+
+
+    def reconstruct_x0(self, sample, model_output, timestep):
+        sigma = self.sigma_from_timestep(
+            timestep,
+            device=sample.device,
+            dtype=sample.dtype,
+        )
+        while sigma.ndim < sample.ndim:
+            sigma = sigma.unsqueeze(-1)
+        return sample - sigma * model_output.to(dtype=sample.dtype)
+
+
     def training_target(self, sample, noise, timestep):
         target = noise - sample
         return target

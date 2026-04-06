@@ -14,7 +14,7 @@
 
 set -euo pipefail
 # unset PINN_CHECKPOINT
-export PINN_CHECKPOINT="./models/train/pinn_plugin_low_noise/step-15000.pt"
+export PINN_CHECKPOINT="./models/train/pinn_plugin_high_noise/step-4000.pt"
 
 # ------------------------
 # Distributed launch safety
@@ -111,6 +111,11 @@ fi
 #   --physics_warmup_steps 2000 \
 #   --save_steps 200 \
 #   --adapter_hidden_dim 64 \
+#   --physics_state_mode x0_hat \
+#   --use_sigma_gate \
+#   --sigma_gate_curve quadratic \
+#   --use_sigma_conditioning \
+#   --sigma_gate_floor 0.05 \
 #   --moe_top_k "${MOE_TOP_K}" \
 #   ${MOE_FAST_MODE_FLAG} \
 #   --moe_pde_branches_per_sample "${MOE_PDE_BRANCHES_PER_SAMPLE}" \
@@ -132,16 +137,21 @@ accelerate launch \
   --width "${WIDTH}" \
   --num_frames "${NUM_FRAMES}" \
   --dataset_repeat 1 \
-  --model_id_with_origin_paths "Wan-AI/Wan2.2-T2V-A14B:low_noise_model/diffusion_pytorch_model*.safetensors,Wan-AI/Wan2.2-T2V-A14B:models_t5_umt5-xxl-enc-bf16.pth,Wan-AI/Wan2.2-T2V-A14B:Wan2.1_VAE.pth" \
+  --model_id_with_origin_paths "Wan-AI/Wan2.2-T2V-A14B:high_noise_model/diffusion_pytorch_model*.safetensors,Wan-AI/Wan2.2-T2V-A14B:models_t5_umt5-xxl-enc-bf16.pth,Wan-AI/Wan2.2-T2V-A14B:Wan2.1_VAE.pth" \
   --learning_rate 1e-5 \
-  --num_epochs 3 \
-  --output_path "./models/train/pinn_plugin_low_noise" \
-  --max_timestep_boundary 1 \
-  --min_timestep_boundary 0.417 \
+  --num_epochs 1 \
+  --output_path "./models/train/pinn_plugin_high_noise_new" \
+  --max_timestep_boundary 0.417 \
+  --min_timestep_boundary 0 \
   --physics_weight 0.05 \
   --physics_warmup_steps 2000 \
   --save_steps 200 \
   --adapter_hidden_dim 64 \
+  --physics_state_mode x0_hat \
+  --use_sigma_gate \
+  --sigma_gate_curve quadratic \
+  --use_sigma_conditioning \
+  --sigma_gate_floor 0.05 \
   --moe_top_k "${MOE_TOP_K}" \
   ${MOE_FAST_MODE_FLAG} \
   --moe_pde_branches_per_sample "${MOE_PDE_BRANCHES_PER_SAMPLE}" \
@@ -176,6 +186,11 @@ accelerate launch \
 #   --physics_weight 0.1 \
 #   --physics_warmup_steps 500 \
 #   --adapter_hidden_dim 64 \
+#   --physics_state_mode x0_hat \
+#   --use_sigma_gate \
+#   --sigma_gate_curve quadratic \
+#   --use_sigma_conditioning \
+#   --sigma_gate_floor 0.05 \
 #   --moe_top_k "${MOE_TOP_K}" \
 #   ${MOE_FAST_MODE_FLAG} \
 #   --moe_pde_branches_per_sample "${MOE_PDE_BRANCHES_PER_SAMPLE}" \
@@ -217,5 +232,3 @@ accelerate launch \
 # ... (same args as baseline) ... \
 #   --output_path "./models/train/pinn_plugin_ablation_label_only" \
 #   --ablate_label_only_router
-
-

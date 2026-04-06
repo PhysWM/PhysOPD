@@ -13,11 +13,11 @@ fi
 # export OPENAI_MODEL=gpt-4.1-mini
 
 # Basic inference with automatic LLM routing labels
-python examples/wanvideo/pinn_inference/inference_pinn.py \
-    --prompt "A spoon swirls inside a cup of hot tea." \
-    --checkpoint_path /home/dataset-assist-0/algorithm/cong.wang/DiffSynth-Studio/models/train/pinn_plugin_high_noise_new/step-8200.pt \
+python examples/wanvideo/pinn_inference/inference_pinn2.py \
+    --prompt "Placing an egg in a pan." \
+    --checkpoint_path models/train/pinn_plugin_low_noise/pinn_plugin_final.pt \
     --auto_label_from_prompt \
-    --output video_pinn_spoon.mp4
+    --output video_pinn_egg2.mp4
 
 # Raw n/q metadata inference (recommended if you want to override routing manually)
 # You can pass raw fields directly; script will auto-encode to adapter metadata.

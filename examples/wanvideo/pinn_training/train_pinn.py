@@ -102,6 +102,12 @@ class WanPINNTrainingModule(DiffusionTrainingModule):
         motion_mask_floor=0.08,
         motion_mask_quantile=0.9,
         motion_mask_warmup_steps=300,
+        physics_state_mode="x0_hat",
+        use_sigma_gate=True,
+        sigma_gate_curve="quadratic",
+        use_sigma_conditioning=True,
+        sigma_conditioning_dim=None,
+        sigma_gate_floor=0.05,
         # LoRA（兼容原框架，但 PINN 模式下通常不用）
         lora_base_model=None,
         lora_target_modules="q,k,v,o,ffn.0,ffn.2",
@@ -157,6 +163,14 @@ class WanPINNTrainingModule(DiffusionTrainingModule):
             num_phenomena=len(PHENOMENON_LABELS),
             moe_top_k=moe_top_k,
             pde_residuals=None,  # 稍后设置，因为还需要创建 pde_residuals
+            physics_state_mode=physics_state_mode,
+            use_sigma_gate=use_sigma_gate,
+            sigma_gate_curve=sigma_gate_curve,
+            use_sigma_conditioning=use_sigma_conditioning,
+            sigma_conditioning_dim=(
+                adapter_hidden_dim if sigma_conditioning_dim is None else sigma_conditioning_dim
+            ),
+            sigma_gate_floor=sigma_gate_floor,
         )
         self.physics_adapter.train()
         self.physics_adapter.requires_grad_(True)
@@ -253,6 +267,12 @@ class WanPINNTrainingModule(DiffusionTrainingModule):
         self.motion_mask_floor = min(max(float(motion_mask_floor), 0.0), 0.5)
         self.motion_mask_quantile = min(max(float(motion_mask_quantile), 0.5), 0.995)
         self.motion_mask_warmup_steps = max(int(motion_mask_warmup_steps), 0)
+        self.physics_state_mode = physics_state_mode
+        self.use_sigma_gate = bool(use_sigma_gate)
+        self.sigma_gate_curve = sigma_gate_curve
+        self.use_sigma_conditioning = bool(use_sigma_conditioning)
+        self.sigma_conditioning_dim = int(self.physics_adapter.sigma_conditioning_dim)
+        self.sigma_gate_floor = float(self.physics_adapter.sigma_gate_floor)
         self.current_step = 0
         self._last_metrics = {}
 
@@ -276,6 +296,12 @@ class WanPINNTrainingModule(DiffusionTrainingModule):
         print(f"  motion_mask_floor={self.motion_mask_floor}")
         print(f"  motion_mask_quantile={self.motion_mask_quantile}")
         print(f"  motion_mask_warmup_steps={self.motion_mask_warmup_steps}")
+        print(f"  physics_state_mode={self.physics_state_mode}")
+        print(f"  use_sigma_gate={self.use_sigma_gate}")
+        print(f"  sigma_gate_curve={self.sigma_gate_curve}")
+        print(f"  use_sigma_conditioning={self.use_sigma_conditioning}")
+        print(f"  sigma_conditioning_dim={self.sigma_conditioning_dim}")
+        print(f"  sigma_gate_floor={self.sigma_gate_floor}")
     
     
     def get_physics_weight(self):
@@ -349,7 +375,41 @@ class WanPINNTrainingModule(DiffusionTrainingModule):
         key = re.sub(r"[^a-z0-9]+", "_", key)
         return key.strip("_") or "unknown"
 
-    def _build_motion_mask(self, v_original, z_t):
+    def _scheduler_sigma(self, timestep, device, dtype):
+        sigma = self.pipe.scheduler.sigma_from_timestep(
+            timestep,
+            device=device,
+            dtype=dtype,
+        )
+        if sigma.ndim == 0:
+            sigma = sigma.unsqueeze(0)
+        return sigma
+
+    @staticmethod
+    def _expand_sigma_for_like(sigma, ref_tensor):
+        sigma_expanded = sigma.to(device=ref_tensor.device, dtype=ref_tensor.dtype)
+        while sigma_expanded.ndim < ref_tensor.ndim:
+            sigma_expanded = sigma_expanded.unsqueeze(-1)
+        return sigma_expanded
+
+    def _physics_state_from_prediction(self, latents, v_pred, sigma):
+        if self.physics_state_mode == "x0_hat":
+            sigma_expanded = self._expand_sigma_for_like(sigma, latents)
+            return latents - sigma_expanded * v_pred.to(dtype=latents.dtype)
+        return latents
+
+    @staticmethod
+    def _sigma_bucket_metrics(sigma):
+        if not isinstance(sigma, torch.Tensor) or sigma.numel() == 0:
+            return {}
+        sigma_mean = float(sigma.detach().float().mean().item())
+        return {
+            "sigma_bucket_low": float(sigma_mean < 0.33),
+            "sigma_bucket_mid": float(0.33 <= sigma_mean < 0.66),
+            "sigma_bucket_high": float(sigma_mean >= 0.66),
+        }
+
+    def _build_motion_mask(self, v_original, state_for_mask):
         """
         基于速度场时序变化 + 空间梯度，构建自监督 soft motion mask: [B,1,T,H,W]。
         """
@@ -361,11 +421,15 @@ class WanPINNTrainingModule(DiffusionTrainingModule):
         if T > 1:
             v_dt = torch.mean(torch.abs(v_original[:, :, 1:] - v_original[:, :, :-1]), dim=1, keepdim=True)
             v_dt = F.pad(v_dt, (0, 0, 0, 0, 0, 1))
-            z_dt = torch.mean(torch.abs(z_t[:, :, 1:] - z_t[:, :, :-1]), dim=1, keepdim=True)
-            z_dt = F.pad(z_dt, (0, 0, 0, 0, 0, 1))
+            state_dt = torch.mean(
+                torch.abs(state_for_mask[:, :, 1:] - state_for_mask[:, :, :-1]),
+                dim=1,
+                keepdim=True,
+            )
+            state_dt = F.pad(state_dt, (0, 0, 0, 0, 0, 1))
         else:
             v_dt = zero
-            z_dt = zero
+            state_dt = zero
 
         if H > 1:
             v_dh = torch.mean(torch.abs(v_original[:, :, :, 1:, :] - v_original[:, :, :, :-1, :]), dim=1, keepdim=True)
@@ -380,7 +444,7 @@ class WanPINNTrainingModule(DiffusionTrainingModule):
             v_dw = zero
 
         spatial_energy = 0.5 * (v_dh + v_dw)
-        energy = 0.55 * v_dt + 0.25 * z_dt + 0.20 * spatial_energy
+        energy = 0.55 * v_dt + 0.25 * state_dt + 0.20 * spatial_energy
 
         # 每个样本独立稳健归一化，避免全局尺度偏置到背景纹理。
         energy_flat = energy.float().reshape(B, -1)
@@ -499,22 +563,22 @@ class WanPINNTrainingModule(DiffusionTrainingModule):
             "motion_mask_sparsity": float((1.0 - active.mean()).item()),
         }
 
-    def compute_physics_loss(self, v_pred, z_t, label_name, metadata=None):
+    def compute_physics_loss(self, v_pred, physics_state, label_name, metadata=None):
         """计算 PDE 残差损失 - 使用现象直接路由"""
         # Aggressive clamping at entry point
         v_pred = torch.clamp(v_pred, min=-10.0, max=10.0)
-        z_t = torch.clamp(z_t, min=-10.0, max=10.0)
+        physics_state = torch.clamp(physics_state, min=-10.0, max=10.0)
 
         pde_metadata = None if self.ablate_disable_conditioned_pde else metadata
         phenomenon_name = label_name.lower() if isinstance(label_name, str) else ""
         residual_method_name = PHENOMENON_TO_RESIDUAL_METHOD.get(phenomenon_name)
         if residual_method_name is not None:
             residual_method = getattr(self.pde_residuals, residual_method_name)
-            loss, info = residual_method(z_t, v_pred, metadata=pde_metadata)
+            loss, info = residual_method(physics_state, v_pred, metadata=pde_metadata)
         else:
             # If phenomenon not found, use a default (e.g., Fluid)
             default_residual = getattr(self.pde_residuals, "fluid_residual")
-            loss, info = default_residual(z_t, v_pred, metadata=pde_metadata)
+            loss, info = default_residual(physics_state, v_pred, metadata=pde_metadata)
 
         # NaN 保护：确保 loss 不是 NaN/Inf，并裁剪到合理范围
         if torch.isnan(loss) or torch.isinf(loss):
@@ -536,7 +600,7 @@ class WanPINNTrainingModule(DiffusionTrainingModule):
             with torch.no_grad():
                 unmasked_metadata = self._metadata_without_motion_mask(pde_metadata)
                 unmasked_loss, _ = residual_method(
-                    z_t.detach(),
+                    physics_state.detach(),
                     v_pred.detach(),
                     metadata=unmasked_metadata,
                 )
@@ -583,7 +647,7 @@ class WanPINNTrainingModule(DiffusionTrainingModule):
             expert_metadata["n_numeric"] = expert_metadata["n_numeric"].to(dtype=dtype)
         return expert_metadata
 
-    def compute_multi_expert_physics_loss(self, z_t, metadata=None, collect_diagnostics=True):
+    def compute_multi_expert_physics_loss(self, z_t, sigma, metadata=None, collect_diagnostics=True):
         cache = getattr(self.physics_adapter, "_cache", {})
         branch_outputs = cache.get("branch_v_corrected_live")
         branch_corrections = cache.get("branch_raw_corrections_live")
@@ -608,6 +672,7 @@ class WanPINNTrainingModule(DiffusionTrainingModule):
 
         for sample_idx in range(branch_outputs.shape[0]):
             z_sample = z_t[sample_idx:sample_idx + 1]
+            sigma_sample = sigma[sample_idx:sample_idx + 1]
             sample_weights = branch_weights[sample_idx]
             if self.moe_fast_mode:
                 selected = torch.nonzero(
@@ -647,6 +712,11 @@ class WanPINNTrainingModule(DiffusionTrainingModule):
                 # PDE residuals must act on the decoded latent velocity branch,
                 # not on hidden physics features.
                 branch_v = branch_outputs[sample_idx, branch_idx].unsqueeze(0)
+                branch_state = self._physics_state_from_prediction(
+                    z_sample,
+                    branch_v,
+                    sigma_sample,
+                )
                 branch_metadata = self._metadata_for_sample_and_expert(
                     metadata=metadata,
                     sample_idx=sample_idx,
@@ -655,7 +725,11 @@ class WanPINNTrainingModule(DiffusionTrainingModule):
                     dtype=branch_v.dtype,
                 )
                 residual_method = getattr(self.pde_residuals, residual_method_name)
-                expert_loss, expert_info = residual_method(z_sample, branch_v, metadata=branch_metadata)
+                expert_loss, expert_info = residual_method(
+                    branch_state,
+                    branch_v,
+                    metadata=branch_metadata,
+                )
                 # NaN 保护：确保 expert_loss 不是 NaN/Inf
                 if torch.isnan(expert_loss) or torch.isinf(expert_loss):
                     expert_loss = torch.zeros_like(expert_loss)
@@ -667,7 +741,7 @@ class WanPINNTrainingModule(DiffusionTrainingModule):
                         unmasked_metadata = self._metadata_without_motion_mask(branch_metadata)
                         with torch.no_grad():
                             unmasked_expert_loss, _ = residual_method(
-                                z_sample.detach(),
+                                branch_state.detach(),
                                 branch_v.detach(),
                                 metadata=unmasked_metadata,
                             )
@@ -1001,7 +1075,20 @@ class WanPINNTrainingModule(DiffusionTrainingModule):
             device=v_original.device,
             dtype=v_original.dtype,
         )
-        motion_mask = self._build_motion_mask(v_original.detach(), z_t.detach())
+        sigma = self._scheduler_sigma(
+            timestep,
+            device=v_original.device,
+            dtype=v_original.dtype,
+        )
+        physics_state_original = self._physics_state_from_prediction(
+            z_t,
+            v_original,
+            sigma,
+        )
+        motion_mask = self._build_motion_mask(
+            v_original.detach(),
+            physics_state_original.detach(),
+        )
         if isinstance(metadata, dict):
             metadata = dict(metadata)
         else:
@@ -1022,13 +1109,23 @@ class WanPINNTrainingModule(DiffusionTrainingModule):
         # ============================================================
         # 2. PhysicsAdapter 施加物理校正（trainable, has grad）
         # ============================================================
-        v_corrected = self.physics_adapter(v_original, z_t, metadata=adapter_metadata)
+        v_corrected = self.physics_adapter(
+            v_original,
+            physics_state_original,
+            sigma=sigma,
+            metadata=adapter_metadata,
+        )
 
         # Aggressive clamping immediately after v_corrected computation
-        v_corrected = torch.clamp(v_corrected, min=-10.0, max=10.0)
+        # v_corrected = torch.clamp(v_corrected, min=-10.0, max=10.0)
         if torch.isnan(v_corrected).any() or torch.isinf(v_corrected).any():
             print(f"[WARNING] NaN/Inf detected in v_corrected at step {self.current_step}, replacing with v_original")
             v_corrected = v_original.clone()
+        physics_state_corrected = self._physics_state_from_prediction(
+            z_t,
+            v_corrected,
+            sigma,
+        )
 
         
         # ============================================================
@@ -1054,6 +1151,7 @@ class WanPINNTrainingModule(DiffusionTrainingModule):
         ):
             loss_physics, physics_info, expert_stats = self.compute_multi_expert_physics_loss(
                 z_t=z_t,
+                sigma=sigma,
                 metadata=pde_metadata,
                 collect_diagnostics=collect_diagnostics,
             )
@@ -1061,7 +1159,7 @@ class WanPINNTrainingModule(DiffusionTrainingModule):
             # Get phenomenon label from metadata
             label_name = metadata.get("label_name", "Fluid") if isinstance(metadata, dict) else "Fluid"
             loss_physics, physics_info = self.compute_physics_loss(
-                v_corrected, z_t, label_name, metadata=pde_metadata
+                v_corrected, physics_state_corrected, label_name, metadata=pde_metadata
             )
         cond_alpha = self.get_conditioned_alpha()
         parse_ratio = 1.0
@@ -1078,6 +1176,10 @@ class WanPINNTrainingModule(DiffusionTrainingModule):
         # (b) 适配器校正不应偏离原始输出太多（正则化）
         correction = v_corrected - v_original
         loss_reg = torch.mean(correction ** 2)
+        correction_ratio = float(
+            correction.detach().abs().mean().item() /
+            (v_original.detach().abs().mean().item() + 1e-10)
+        )
         # Clamp to prevent overflow
         loss_reg = torch.clamp(loss_reg, min=0.0, max=100.0)
         if torch.isnan(loss_reg) or torch.isinf(loss_reg):
@@ -1148,7 +1250,14 @@ class WanPINNTrainingModule(DiffusionTrainingModule):
             "expert_balance": float(loss_expert_balance.detach().item()),
             "condition_consistency": float(loss_condition_consistency.detach().item()),
             "parse_success_ratio": parse_ratio,
+            "sigma_mean": float(sigma.detach().float().mean().item()),
+            "sigma_gate_mean": float(cache.get("sigma_gate", torch.ones(1, device=v_corrected.device)).float().mean().item()),
+            "effective_scale_mean": float(cache.get("effective_scale", torch.zeros(1, device=v_corrected.device)).float().mean().item()),
+            "raw_correction_norm_mean": float(cache.get("raw_correction_norm", torch.zeros(1, device=v_corrected.device)).float().mean().item()),
+            "gated_correction_norm_mean": float(cache.get("gated_correction_norm", torch.zeros(1, device=v_corrected.device)).float().mean().item()),
+            "correction_ratio": correction_ratio,
             **motion_mask_metrics,
+            **self._sigma_bucket_metrics(sigma),
             **{f"physics_{k}": v for k, v in physics_info.items()},
             **router_metrics,
             **expert_residual_metrics,
@@ -1228,7 +1337,7 @@ class PINNModelLogger(ModelLogger):
                 'physics_adapter_state_dict': physics_adapter_state_dict,
                 'pde_residuals_state_dict': pde_residuals_state_dict,
                 'config': {
-                    'checkpoint_format_version': 2,
+                    'checkpoint_format_version': 4,
                     'physics_weight': unwrapped_model.physics_weight if hasattr(unwrapped_model, 'physics_weight') else None,
                     'conditioned_physics_warmup_steps': (
                         unwrapped_model.conditioned_physics_warmup_steps
@@ -1257,6 +1366,30 @@ class PINNModelLogger(ModelLogger):
                     'moe_weight_threshold': (
                         unwrapped_model.moe_weight_threshold
                         if hasattr(unwrapped_model, 'moe_weight_threshold') else 0.05
+                    ),
+                    'physics_state_mode': (
+                        unwrapped_model.physics_state_mode
+                        if hasattr(unwrapped_model, 'physics_state_mode') else "x0_hat"
+                    ),
+                    'use_sigma_gate': (
+                        unwrapped_model.use_sigma_gate
+                        if hasattr(unwrapped_model, 'use_sigma_gate') else True
+                    ),
+                    'sigma_gate_curve': (
+                        unwrapped_model.sigma_gate_curve
+                        if hasattr(unwrapped_model, 'sigma_gate_curve') else "quadratic"
+                    ),
+                    'use_sigma_conditioning': (
+                        unwrapped_model.use_sigma_conditioning
+                        if hasattr(unwrapped_model, 'use_sigma_conditioning') else True
+                    ),
+                    'sigma_conditioning_dim': (
+                        unwrapped_model.sigma_conditioning_dim
+                        if hasattr(unwrapped_model, 'sigma_conditioning_dim') else None
+                    ),
+                    'sigma_gate_floor': (
+                        unwrapped_model.sigma_gate_floor
+                        if hasattr(unwrapped_model, 'sigma_gate_floor') else 0.05
                     ),
                     'ablation_flags': {
                         'ablate_disable_moe': (
@@ -1407,6 +1540,40 @@ def pinn_parser():
         "--motion_mask_warmup_steps", type=int, default=300,
         help="Warmup steps to blend from uniform mask to motion mask (default: 300)."
     )
+    parser.add_argument(
+        "--physics_state_mode", type=str, default="x0_hat", choices=["x0_hat", "z_t"],
+        help="State fed into the physics branch: x0_hat or z_t (default: x0_hat)."
+    )
+    parser.add_argument(
+        "--use_sigma_gate", action="store_true",
+        help="Enable sigma-based correction gating in the physics adapter."
+    )
+    parser.add_argument(
+        "--no_use_sigma_gate", dest="use_sigma_gate", action="store_false",
+        help="Disable sigma-based correction gating."
+    )
+    parser.set_defaults(use_sigma_gate=True)
+    parser.add_argument(
+        "--sigma_gate_curve", type=str, default="quadratic", choices=["quadratic", "linear", "hard"],
+        help="Curve used for sigma correction gate (default: quadratic)."
+    )
+    parser.add_argument(
+        "--use_sigma_conditioning", action="store_true",
+        help="Enable explicit sigma conditioning inside the physics adapter."
+    )
+    parser.add_argument(
+        "--no_use_sigma_conditioning", dest="use_sigma_conditioning", action="store_false",
+        help="Disable explicit sigma conditioning inside the physics adapter."
+    )
+    parser.set_defaults(use_sigma_conditioning=True)
+    parser.add_argument(
+        "--sigma_conditioning_dim", type=int, default=None,
+        help="Hidden dimension of the sigma conditioning MLP (default: adapter_hidden_dim)."
+    )
+    parser.add_argument(
+        "--sigma_gate_floor", type=float, default=0.05,
+        help="Minimum floor for sigma gate strength (default: 0.05)."
+    )
     
     return parser
 
@@ -1448,6 +1615,12 @@ if __name__ == "__main__":
         motion_mask_floor=args.motion_mask_floor,
         motion_mask_quantile=args.motion_mask_quantile,
         motion_mask_warmup_steps=args.motion_mask_warmup_steps,
+        physics_state_mode=args.physics_state_mode,
+        use_sigma_gate=args.use_sigma_gate,
+        sigma_gate_curve=args.sigma_gate_curve,
+        use_sigma_conditioning=args.use_sigma_conditioning,
+        sigma_conditioning_dim=args.sigma_conditioning_dim,
+        sigma_gate_floor=args.sigma_gate_floor,
         # LoRA 参数（可选）
         lora_base_model=args.lora_base_model,
         lora_target_modules=args.lora_target_modules,

@@ -52,6 +52,12 @@ class PhysicsAdapter(nn.Module):
         shared_expert_weight=0.3,
         moe_top_k=4,
         pde_residuals=None,
+        physics_state_mode="x0_hat",
+        use_sigma_gate=True,
+        sigma_gate_curve="quadratic",
+        use_sigma_conditioning=True,
+        sigma_conditioning_dim=None,
+        sigma_gate_floor=0.05,
     ):
         super().__init__()
 
@@ -71,6 +77,14 @@ class PhysicsAdapter(nn.Module):
         self.pde_residuals = pde_residuals  # Reference to PDE residuals module
         self.apply_constraints_in_forward = True  # Enable constraint application
         self.constraint_step_size = 0.01  # Small step size for constraint enforcement
+        self.physics_state_mode = physics_state_mode
+        self.use_sigma_gate = bool(use_sigma_gate)
+        self.sigma_gate_curve = sigma_gate_curve
+        self.use_sigma_conditioning = bool(use_sigma_conditioning)
+        self.sigma_conditioning_dim = (
+            hidden_dim if sigma_conditioning_dim is None else max(int(sigma_conditioning_dim), 1)
+        )
+        self.sigma_gate_floor = min(max(float(sigma_gate_floor), 0.0), 1.0)
 
         # 共享物理特征提取器（4层残差网络）
         self.physics_encoder_shared = nn.Sequential(
@@ -125,6 +139,11 @@ class PhysicsAdapter(nn.Module):
             nn.Linear(hidden_dim * 3, hidden_dim),
             nn.SiLU(),
             nn.Linear(hidden_dim, hidden_dim),
+        )
+        self.sigma_condition_proj = nn.Sequential(
+            nn.Linear(1, self.sigma_conditioning_dim),
+            nn.SiLU(),
+            nn.Linear(self.sigma_conditioning_dim, hidden_dim),
         )
         self.expert_router = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
@@ -217,6 +236,61 @@ class PhysicsAdapter(nn.Module):
         # 裁剪过大的值
         correction = torch.clamp(correction, min=-max_norm, max=max_norm)
         return correction
+
+    def _prepare_sigma_values(self, sigma, batch_size, device, dtype):
+        if sigma is None:
+            return None
+
+        if not isinstance(sigma, torch.Tensor):
+            sigma = torch.tensor(sigma, device=device, dtype=dtype)
+        else:
+            sigma = sigma.to(device=device, dtype=dtype)
+
+        if sigma.ndim == 0:
+            sigma = sigma.unsqueeze(0)
+        sigma = sigma.reshape(-1)
+        if sigma.shape[0] == 1 and batch_size > 1:
+            sigma = sigma.repeat(batch_size)
+        if sigma.shape[0] != batch_size:
+            sigma = sigma[:1].repeat(batch_size)
+        return torch.clamp(sigma, 0.0, 1.0)
+
+    def _sigma_gate(self, sigma, ref_tensor):
+        if (not self.use_sigma_gate) or sigma is None:
+            return torch.ones(
+                ref_tensor.shape[0], 1, 1, 1, 1,
+                device=ref_tensor.device,
+                dtype=ref_tensor.dtype,
+            )
+
+        sigma = self._prepare_sigma_values(
+            sigma,
+            batch_size=ref_tensor.shape[0],
+            device=ref_tensor.device,
+            dtype=ref_tensor.dtype,
+        )
+
+        if self.sigma_gate_curve == "linear":
+            base_gate = 1.0 - sigma
+        elif self.sigma_gate_curve == "hard":
+            base_gate = torch.clamp((0.5 - sigma) / 0.5, min=0.0, max=1.0)
+        else:
+            base_gate = (1.0 - sigma) ** 2
+        gate = self.sigma_gate_floor + (1.0 - self.sigma_gate_floor) * base_gate
+        return gate.view(ref_tensor.shape[0], 1, 1, 1, 1)
+
+    def _sigma_embedding(self, sigma, batch_size, device, dtype):
+        if (not self.use_sigma_conditioning) or sigma is None:
+            return torch.zeros(batch_size, self.hidden_dim, device=device, dtype=dtype)
+
+        sigma_values = self._prepare_sigma_values(
+            sigma,
+            batch_size=batch_size,
+            device=device,
+            dtype=dtype,
+        )
+        sigma_feat = self.sigma_condition_proj(sigma_values.view(batch_size, 1))
+        return sigma_feat.to(dtype=dtype)
 
     def _route_label_ids(self, metadata, batch_size, device):
         """
@@ -322,7 +396,7 @@ class PhysicsAdapter(nn.Module):
         )
         return route_logits, topk_indices, topk_weights, dominant_expert, primary_label_ids
     
-    def forward(self, v_original, z_t, metadata=None):
+    def forward(self, v_original, state_for_physics, sigma=None, metadata=None):
         """
         Forward pass: Apply physics-informed corrections via MoE expert routing.
 
@@ -331,21 +405,32 @@ class PhysicsAdapter(nn.Module):
 
         Args:
             v_original: 原始模型预测的速度场 [B, C, T, H, W]
-            z_t: 当前的latent [B, C, T, H, W]
+            state_for_physics: 用于物理建模的状态 [B, C, T, H, W]
             metadata: 条件输入字典（label_id/label_name/n/q）
 
         Returns:
             v_corrected: 物理校正后的速度场 [B, C, T, H, W]
         """
         B = v_original.shape[0]
+        sigma_gate = self._sigma_gate(sigma, v_original)
+        sigma_embed = self._sigma_embedding(
+            sigma,
+            batch_size=B,
+            device=v_original.device,
+            dtype=v_original.dtype,
+        )
+        sigma_map = sigma_embed.view(B, self.hidden_dim, 1, 1, 1)
+        gate_scale = self.scale * sigma_gate
 
         # 使用共享编码器获取基础物理特征（用于 fallback 和条件编码）
-        physics_feat_shared = self.physics_encoder_shared(z_t)  # [B, hidden_dim, T, H, W]
+        physics_feat_shared = self.physics_encoder_shared(state_for_physics)  # [B, hidden_dim, T, H, W]
+        physics_feat_shared = physics_feat_shared + sigma_map
 
         if metadata is None or not self.use_moe:
             raw_correction = self.physics_correction_fallback(physics_feat_shared)
             raw_correction = self._safe_correction(raw_correction)
-            v_corrected = v_original + self.scale * raw_correction
+            gated_correction = gate_scale * raw_correction
+            v_corrected = v_original + gated_correction
             topk_shape = (B, self.moe_top_k)
             branch_feat_shape = (B, self.moe_top_k, *physics_feat_shared.shape[1:])
             branch_latent_shape = (B, self.moe_top_k, *v_original.shape[1:])
@@ -362,8 +447,10 @@ class PhysicsAdapter(nn.Module):
                 "raw_correction": raw_correction.detach(),
                 "expert_output": torch.zeros_like(physics_feat_shared).detach(),
                 "cond_feat": torch.zeros(B, self.hidden_dim, device=v_original.device).detach(),
+                "sigma_embedding": sigma_embed.detach(),
                 "expert_output_live": torch.zeros_like(physics_feat_shared),
                 "cond_feat_live": torch.zeros(B, self.hidden_dim, device=v_original.device, dtype=physics_feat_shared.dtype),
+                "sigma_embedding_live": sigma_embed,
                 "label_ids": torch.zeros(B, dtype=torch.long, device=v_original.device),
                 "active_expert_indices": zero_indices,
                 "active_expert_weights": zero_weights,
@@ -377,10 +464,15 @@ class PhysicsAdapter(nn.Module):
                 "branch_v_corrected_live": zero_branch_corrections,
                 "dominant_expert": torch.zeros(B, dtype=torch.long, device=v_original.device),
                 "route_logits": torch.zeros(B, self.num_phenomena, device=v_original.device),
+                "sigma_gate": sigma_gate.detach(),
+                "effective_scale": gate_scale.detach().view(B),
+                "raw_correction_norm": raw_correction.detach().float().reshape(B, -1).norm(dim=1),
+                "gated_correction_norm": gated_correction.detach().float().reshape(B, -1).norm(dim=1),
             }
             return v_corrected
 
         cond_feat = self._encode_condition(metadata, B, v_original.device, physics_feat_shared.dtype)
+        cond_feat = cond_feat + sigma_embed.to(dtype=cond_feat.dtype)
 
         route_logits, topk_indices, topk_weights, dominant_expert, label_ids = self._route_experts(
             cond_feat=cond_feat,
@@ -431,7 +523,8 @@ class PhysicsAdapter(nn.Module):
                 expert_weight = topk_weights[i, j].to(dtype=physics_feat_shared.dtype)
 
                 # 每个专家使用自己的编码器提取物理特征
-                expert_physics_feat = self.expert_physics_encoders[expert_idx](z_t[i:i + 1])
+                expert_physics_feat = self.expert_physics_encoders[expert_idx](state_for_physics[i:i + 1])
+                expert_physics_feat = expert_physics_feat + sigma_map[i:i + 1].to(dtype=expert_physics_feat.dtype)
                 branch_physics_features[i:i + 1, j] = expert_physics_feat
 
                 # 将条件特征与专家编码的物理特征拼接
@@ -449,7 +542,7 @@ class PhysicsAdapter(nn.Module):
                 branch_raw_correction = self._safe_correction(branch_raw_correction)
                 branch_raw_corrections[i:i + 1, j] = branch_raw_correction
                 branch_v_corrected[i:i + 1, j] = (
-                    v_original[i:i + 1] + self.scale * branch_raw_correction
+                    v_original[i:i + 1] + gate_scale[i:i + 1] * branch_raw_correction
                 )
 
                 # 加权累加专家输出
@@ -491,7 +584,8 @@ class PhysicsAdapter(nn.Module):
         raw_correction = final_correction
         # 安全处理：防止 NaN/Inf 和数值爆炸
         raw_correction = self._safe_correction(raw_correction)
-        v_corrected = v_original + self.scale * raw_correction
+        gated_correction = gate_scale * raw_correction
+        v_corrected = v_original + gated_correction
 
         with torch.no_grad():
             hist = torch.zeros(self.num_phenomena, device=v_original.device, dtype=torch.float32)
@@ -514,8 +608,10 @@ class PhysicsAdapter(nn.Module):
             "raw_correction": raw_correction.detach(), # [B, C, T, H, W] (未乘 scale)
             "expert_output": expert_output.detach(),
             "cond_feat": cond_feat.detach(),
+            "sigma_embedding": sigma_embed.detach(),
             "expert_output_live": expert_output,
             "cond_feat_live": cond_feat,
+            "sigma_embedding_live": sigma_embed,
             "label_ids": label_ids.detach(),
             "active_expert_indices": topk_indices.detach(),
             "active_expert_weights": topk_weights.detach(),
@@ -529,6 +625,10 @@ class PhysicsAdapter(nn.Module):
             "branch_v_corrected_live": branch_v_corrected,
             "dominant_expert": dominant_expert.detach(),
             "route_logits": route_logits.detach(),
+            "sigma_gate": sigma_gate.detach(),
+            "effective_scale": gate_scale.detach().view(B),
+            "raw_correction_norm": raw_correction.detach().float().reshape(B, -1).norm(dim=1),
+            "gated_correction_norm": gated_correction.detach().float().reshape(B, -1).norm(dim=1),
         }
 
         return v_corrected

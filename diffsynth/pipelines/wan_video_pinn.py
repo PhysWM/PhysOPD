@@ -45,6 +45,12 @@ class PhysicsInformedWanVideoPipeline(WanVideoPipeline):
         # 物理约束开关
         self.enable_physics_constraint = True
         self.use_physics_adapter = True  # 是否使用适配器（插件模式）
+        self.physics_state_mode = "x0_hat"
+        self.use_sigma_gate = True
+        self.sigma_gate_curve = "quadratic"
+        self.use_sigma_conditioning = True
+        self.sigma_conditioning_dim = 64
+        self.sigma_gate_floor = 0.05
         
         # 推理时的物理场实时追踪记录（每次推理自动填充）
         self.physics_tracking = None
@@ -166,6 +172,29 @@ class PhysicsInformedWanVideoPipeline(WanVideoPipeline):
         if label_name != "":
             metadata["label_name"] = label_name
         return metadata
+
+    def _scheduler_sigma(self, timestep, device, dtype):
+        sigma = self.scheduler.sigma_from_timestep(
+            timestep,
+            device=device,
+            dtype=dtype,
+        )
+        if sigma.ndim == 0:
+            sigma = sigma.unsqueeze(0)
+        return sigma
+
+    @staticmethod
+    def _expand_sigma_for_like(sigma, ref_tensor):
+        sigma_expanded = sigma.to(device=ref_tensor.device, dtype=ref_tensor.dtype)
+        while sigma_expanded.ndim < ref_tensor.ndim:
+            sigma_expanded = sigma_expanded.unsqueeze(-1)
+        return sigma_expanded
+
+    def _physics_state_from_prediction(self, latents, v_pred, sigma):
+        if self.physics_state_mode == "x0_hat":
+            sigma_expanded = self._expand_sigma_for_like(sigma, latents)
+            return latents - sigma_expanded * v_pred.to(dtype=latents.dtype)
+        return latents
     
     @staticmethod
     def from_pretrained(
@@ -448,10 +477,32 @@ class PhysicsInformedWanVideoPipeline(WanVideoPipeline):
             device = self.device
 
         checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+        config = checkpoint.get("config", {})
+        checkpoint_format_version = int(config.get("checkpoint_format_version", 0) or 0)
+        self.physics_state_mode = config.get("physics_state_mode", self.physics_state_mode)
+        self.use_sigma_gate = bool(config.get("use_sigma_gate", self.use_sigma_gate))
+        self.sigma_gate_curve = config.get("sigma_gate_curve", self.sigma_gate_curve)
+        default_sigma_conditioning = self.use_sigma_conditioning if checkpoint_format_version >= 4 else False
+        default_sigma_gate_floor = self.sigma_gate_floor if checkpoint_format_version >= 4 else 0.0
+        self.use_sigma_conditioning = bool(
+            config.get("use_sigma_conditioning", default_sigma_conditioning)
+        )
+        sigma_conditioning_dim = config.get("sigma_conditioning_dim", self.sigma_conditioning_dim)
+        if sigma_conditioning_dim is not None:
+            self.sigma_conditioning_dim = int(sigma_conditioning_dim)
+        self.sigma_gate_floor = float(config.get("sigma_gate_floor", default_sigma_gate_floor))
         
         if 'physics_adapter_state_dict' in checkpoint:
             latent_dim = 16
-            self.initialize_physics_adapter(latent_dim=latent_dim)
+            self.initialize_physics_adapter(
+                latent_dim=latent_dim,
+                physics_state_mode=self.physics_state_mode,
+                use_sigma_gate=self.use_sigma_gate,
+                sigma_gate_curve=self.sigma_gate_curve,
+                use_sigma_conditioning=self.use_sigma_conditioning,
+                sigma_conditioning_dim=self.sigma_conditioning_dim,
+                sigma_gate_floor=self.sigma_gate_floor,
+            )
             load_result = self.physics_adapter.load_state_dict(
                 checkpoint['physics_adapter_state_dict'],
                 strict=False,
@@ -467,6 +518,12 @@ class PhysicsInformedWanVideoPipeline(WanVideoPipeline):
                         1.0 / max(float(self.physics_adapter.num_phenomena), 1.0)
                     )
                 print("  Initialized missing buffer: expert_usage_ema")
+            self.physics_adapter.physics_state_mode = self.physics_state_mode
+            self.physics_adapter.use_sigma_gate = self.use_sigma_gate
+            self.physics_adapter.sigma_gate_curve = self.sigma_gate_curve
+            self.physics_adapter.use_sigma_conditioning = self.use_sigma_conditioning
+            self.physics_adapter.sigma_conditioning_dim = self.sigma_conditioning_dim
+            self.physics_adapter.sigma_gate_floor = self.sigma_gate_floor
             self.physics_adapter.to(dtype=self.torch_dtype, device=device)
             self.physics_adapter.eval()
             print(f"  PhysicsAdapter loaded (dtype={self.torch_dtype})")
@@ -499,6 +556,9 @@ class PhysicsInformedWanVideoPipeline(WanVideoPipeline):
             latents = kwargs.get("latents")
             if latents is None:
                 return v_original
+            timestep = kwargs.get("timestep")
+            if timestep is None:
+                return v_original
             
             adapter.to(device=v_original.device, dtype=v_original.dtype)
             adapter_metadata = pipeline_ref._prepare_adapter_metadata(
@@ -507,7 +567,22 @@ class PhysicsInformedWanVideoPipeline(WanVideoPipeline):
                 device=v_original.device,
                 dtype=v_original.dtype,
             )
-            v_corrected = adapter(v_original, latents, metadata=adapter_metadata)
+            sigma = pipeline_ref._scheduler_sigma(
+                timestep,
+                device=v_original.device,
+                dtype=v_original.dtype,
+            )
+            physics_state_original = pipeline_ref._physics_state_from_prediction(
+                latents,
+                v_original,
+                sigma,
+            )
+            v_corrected = adapter(
+                v_original,
+                physics_state_original,
+                sigma=sigma,
+                metadata=adapter_metadata,
+            )
             
             _step[0] += 1
             step = _step[0]
@@ -524,6 +599,24 @@ class PhysicsInformedWanVideoPipeline(WanVideoPipeline):
                 v_cf = v_corrected.float()
                 diff = v_cf - v_of
                 scale_val = adapter.scale.item()
+                effective_scale = float(
+                    adapter._cache.get("effective_scale", torch.zeros(1, device=v_original.device))
+                    .float()
+                    .mean()
+                    .item()
+                )
+                raw_correction_norm = float(
+                    adapter._cache.get("raw_correction_norm", torch.zeros(1, device=v_original.device))
+                    .float()
+                    .mean()
+                    .item()
+                )
+                gated_correction_norm = float(
+                    adapter._cache.get("gated_correction_norm", torch.zeros(1, device=v_original.device))
+                    .float()
+                    .mean()
+                    .item()
+                )
                 corr_ratio = diff.abs().mean().item() / (v_of.abs().mean().item() + 1e-10)
                 
                 div_orig = _compute_divergence_sq(v_of)
@@ -535,6 +628,9 @@ class PhysicsInformedWanVideoPipeline(WanVideoPipeline):
                 
                 t["steps"].append(step)
                 t["scale"].append(scale_val)
+                t["effective_scale"].append(effective_scale)
+                t["raw_correction_norm"].append(raw_correction_norm)
+                t["gated_correction_norm"].append(gated_correction_norm)
                 t["correction_ratio"].append(corr_ratio)
                 t["div_before"].append(div_orig)
                 t["div_after"].append(div_corr)
@@ -550,6 +646,9 @@ class PhysicsInformedWanVideoPipeline(WanVideoPipeline):
                 if step <= 3 or step % 10 == 0:
                     div_d = (div_corr - div_orig) / (div_orig + 1e-10) * 100
                     print(f"  [Step {step:3d}] scale={scale_val:.6f}  "
+                          f"eff={effective_scale:.6f}  "
+                          f"raw={raw_correction_norm:.6f}  "
+                          f"gated={gated_correction_norm:.6f}  "
                           f"corr={corr_ratio:.4%}  "
                           f"div: {div_orig:.6f}→{div_corr:.6f} ({div_d:+.1f}%)")
             
@@ -563,7 +662,8 @@ class PhysicsInformedWanVideoPipeline(WanVideoPipeline):
     def reset_tracking(self):
         """在每次推理前调用，重置物理场追踪记录。"""
         self.physics_tracking = {
-            "steps": [], "scale": [], "correction_ratio": [],
+            "steps": [], "scale": [], "effective_scale": [],
+            "raw_correction_norm": [], "gated_correction_norm": [], "correction_ratio": [],
             "div_before": [], "div_after": [],
             "vor_before": [], "vor_after": [],
             "smooth_before": [], "smooth_after": [],
@@ -645,6 +745,9 @@ class PhysicsInformedWanVideoPipeline(WanVideoPipeline):
         div_a = np.mean(t["div_after"])
         div_r = (1 - div_a / (div_b + 1e-10)) * 100
         scale_avg = np.mean(t["scale"])
+        effective_scale_avg = np.mean(t["effective_scale"]) if len(t["effective_scale"]) > 0 else 0.0
+        raw_corr_avg = np.mean(t["raw_correction_norm"]) if len(t["raw_correction_norm"]) > 0 else 0.0
+        gated_corr_avg = np.mean(t["gated_correction_norm"]) if len(t["gated_correction_norm"]) > 0 else 0.0
         ratio_avg = np.mean(t["correction_ratio"]) * 100
         
         print(f"\n  ┌────────────────────── Physics Summary ──────────────────────┐")
@@ -652,6 +755,9 @@ class PhysicsInformedWanVideoPipeline(WanVideoPipeline):
         print(f"  │  Divergence  after  PINN  = {div_a:.6f}                      │")
         print(f"  │  Divergence  reduction    = {div_r:+.2f}%                     │")
         print(f"  │  adapter.scale  avg       = {scale_avg:.6f}                  │")
+        print(f"  │  effective scale avg      = {effective_scale_avg:.6f}                  │")
+        print(f"  │  raw correction norm avg  = {raw_corr_avg:.6f}                  │")
+        print(f"  │  gated corr norm avg      = {gated_corr_avg:.6f}                  │")
         print(f"  │  correction ratio avg     = {ratio_avg:.4f}%                 │")
         if div_r > 1:
             print(f"  │  ✓ PINN 有效降低了物理违约                                  │")
@@ -1175,12 +1281,33 @@ class PhysicsInformedWanVideoPipeline(WanVideoPipeline):
         self.enable_physics_constraint = False
         print("Physics constraint disabled")
     
-    def initialize_physics_adapter(self, latent_dim=16):
+    def initialize_physics_adapter(
+        self,
+        latent_dim=16,
+        physics_state_mode=None,
+        use_sigma_gate=None,
+        sigma_gate_curve=None,
+        use_sigma_conditioning=None,
+        sigma_conditioning_dim=None,
+        sigma_gate_floor=None,
+    ):
         """初始化物理适配器（在模型加载后调用）"""
         if self.physics_adapter is None:
             self.physics_adapter = PhysicsAdapter(
                 latent_dim=latent_dim,
-                hidden_dim=64
+                hidden_dim=64,
+                physics_state_mode=physics_state_mode or self.physics_state_mode,
+                use_sigma_gate=self.use_sigma_gate if use_sigma_gate is None else use_sigma_gate,
+                sigma_gate_curve=sigma_gate_curve or self.sigma_gate_curve,
+                use_sigma_conditioning=(
+                    self.use_sigma_conditioning if use_sigma_conditioning is None else use_sigma_conditioning
+                ),
+                sigma_conditioning_dim=(
+                    self.sigma_conditioning_dim if sigma_conditioning_dim is None else sigma_conditioning_dim
+                ),
+                sigma_gate_floor=(
+                    self.sigma_gate_floor if sigma_gate_floor is None else sigma_gate_floor
+                ),
             ).to(self.device)
             print(f"✓ Physics Adapter initialized (latent_dim={latent_dim})")
         return self.physics_adapter
