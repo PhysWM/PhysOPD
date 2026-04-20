@@ -7,6 +7,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 
+from .pinn_contracts import (
+    EXPERT_FIELD_RECIPES,
+    PHYSICS_ATTR_DIM,
+    split_attribute_bank,
+)
+
 
 class DifferentialOperators:
     """
@@ -124,13 +130,14 @@ class DifferentialOperators:
 class MaterialPDEResiduals(nn.Module):
     """各种材质的PDE残差计算"""
     
-    def __init__(self, num_phenomena=10, q_input_dim=64, n_numeric_dim=12):
+    def __init__(self, num_phenomena=10, q_input_dim=64, n_numeric_dim=12, strict_metadata_contract=False):
         super().__init__()
         self.diff_ops = DifferentialOperators()
         self.num_phenomena = num_phenomena
         self.q_input_dim = q_input_dim
         self.n_numeric_dim = n_numeric_dim
         self.enable_conditioning = True
+        self.strict_metadata_contract = bool(strict_metadata_contract)
         
         # 物理参数（可学习，但有界）
         self.nu = nn.Parameter(torch.tensor(0.01))  # 粘度
@@ -151,26 +158,38 @@ class MaterialPDEResiduals(nn.Module):
         nn.init.zeros_(self.label_embedding.weight)
         nn.init.zeros_(self.q_projector.weight)
         nn.init.zeros_(self.n_projector.weight)
+        self.fail_on_invalid = True
 
     @staticmethod
     def _zero_loss(v):
         return torch.mean(v ** 2) * 0.0
 
-    @staticmethod
-    def _safe_loss(loss, max_value=100.0):
+    def _raise_invalid(self, name, value=None):
+        detail = ""
+        if isinstance(value, torch.Tensor):
+            tensor = value.detach().float()
+            if tensor.numel() > 0:
+                detail = (
+                    f" shape={tuple(tensor.shape)}"
+                    f" min={float(torch.nan_to_num(tensor, nan=0.0, posinf=0.0, neginf=0.0).min().item()):.6f}"
+                    f" max={float(torch.nan_to_num(tensor, nan=0.0, posinf=0.0, neginf=0.0).max().item()):.6f}"
+                )
+        raise FloatingPointError(f"Invalid physics value detected in {name}.{detail}")
+
+    def _safe_loss(self, loss, max_value=100.0, name="loss"):
         """确保 loss 不是 NaN/Inf，并裁剪到合理范围"""
         if loss is None:
-            return torch.tensor(0.0)
+            self._raise_invalid(name, value=None)
 
         # Handle scalar tensors
         if loss.dim() == 0:
             if torch.isnan(loss) or torch.isinf(loss):
-                return torch.tensor(0.0, device=loss.device, dtype=loss.dtype)
+                self._raise_invalid(name, loss)
             return torch.clamp(loss, min=-max_value, max=max_value)
 
         # Handle multi-dimensional tensors
-        loss = torch.where(torch.isnan(loss) | torch.isinf(loss),
-                          torch.zeros_like(loss), loss)
+        if torch.isnan(loss).any() or torch.isinf(loss).any():
+            self._raise_invalid(name, loss)
         return torch.clamp(loss, min=-max_value, max=max_value)
 
     @staticmethod
@@ -180,7 +199,11 @@ class MaterialPDEResiduals(nn.Module):
         return str(metadata.get("label_name", "")).strip().lower()
 
     def _fit_2d(self, tensor, target_dim, batch_size, device, dtype):
+        if target_dim <= 0:
+            return torch.zeros(batch_size, 0, device=device, dtype=dtype)
         if tensor is None:
+            if self.strict_metadata_contract:
+                raise RuntimeError("Residual metadata contract violation: missing required conditioning tensor.")
             return torch.zeros(batch_size, target_dim, device=device, dtype=dtype)
         tensor = tensor.to(device=device, dtype=dtype)
         if tensor.ndim == 1:
@@ -188,26 +211,48 @@ class MaterialPDEResiduals(nn.Module):
         if tensor.shape[0] == 1 and batch_size > 1:
             tensor = tensor.repeat(batch_size, 1)
         if tensor.shape[0] != batch_size:
+            if self.strict_metadata_contract:
+                raise RuntimeError(
+                    f"Residual metadata contract violation: batch mismatch, expected {batch_size}, got {tensor.shape[0]}."
+                )
             tensor = tensor[:1].repeat(batch_size, 1)
         if tensor.shape[1] > target_dim:
+            if self.strict_metadata_contract:
+                raise RuntimeError(
+                    f"Residual metadata contract violation: feature dim mismatch, expected {target_dim}, got {tensor.shape[1]}."
+                )
             tensor = tensor[:, :target_dim]
         elif tensor.shape[1] < target_dim:
+            if self.strict_metadata_contract:
+                raise RuntimeError(
+                    f"Residual metadata contract violation: feature dim mismatch, expected {target_dim}, got {tensor.shape[1]}."
+                )
             pad = torch.zeros(batch_size, target_dim - tensor.shape[1], device=device, dtype=dtype)
             tensor = torch.cat([tensor, pad], dim=1)
         return tensor
 
     def _metadata_condition_vector(self, metadata, batch_size, device, dtype):
         if not isinstance(metadata, dict):
+            if self.strict_metadata_contract:
+                raise RuntimeError("Residual metadata contract violation: metadata must be a dict.")
             return torch.zeros(4, device=device, dtype=dtype), 0.0, 0.0, 0.0
 
         label_ids = metadata.get("label_id")
         if label_ids is None:
+            if self.strict_metadata_contract:
+                raise RuntimeError("Residual metadata contract violation: missing label_id.")
             label_ids = torch.zeros(batch_size, device=device, dtype=torch.long)
+        elif isinstance(label_ids, int):
+            label_ids = torch.tensor([label_ids], device=device, dtype=torch.long)
         else:
             label_ids = label_ids.to(device=device, dtype=torch.long).view(-1)
             if label_ids.numel() == 1 and batch_size > 1:
                 label_ids = label_ids.repeat(batch_size)
             if label_ids.numel() != batch_size:
+                if self.strict_metadata_contract:
+                    raise RuntimeError(
+                        f"Residual metadata contract violation: label batch mismatch, expected {batch_size}, got {label_ids.numel()}."
+                    )
                 label_ids = label_ids[:1].repeat(batch_size)
             label_ids = torch.clamp(label_ids, min=0, max=self.num_phenomena - 1)
 
@@ -303,7 +348,7 @@ class MaterialPDEResiduals(nn.Module):
 
         # Ensure result is finite
         if torch.isnan(result) or torch.isinf(result):
-            return torch.tensor(0.0, device=value.device, dtype=value.dtype)
+            self._raise_invalid("weighted_mean", result)
 
         return torch.clamp(result, min=-100.0, max=100.0)
 
@@ -335,6 +380,368 @@ class MaterialPDEResiduals(nn.Module):
         """Compute vorticity field (curl) using diff_ops."""
         return self.diff_ops.compute_curl_2d(v)
 
+    @staticmethod
+    def _grad_height(field):
+        if field.shape[-2] <= 1:
+            return torch.zeros_like(field)
+        diff = field[..., 1:, :] - field[..., :-1, :]
+        return F.pad(diff, (0, 0, 0, 1))
+
+    @staticmethod
+    def _grad_width(field):
+        if field.shape[-1] <= 1:
+            return torch.zeros_like(field)
+        diff = field[..., :, 1:] - field[..., :, :-1]
+        return F.pad(diff, (0, 1, 0, 0))
+
+    @staticmethod
+    def _pressure_scalar(p):
+        if p.shape[1] == 1:
+            return p
+        return p.mean(dim=1, keepdim=True)
+
+    def _only_u_fluid_terms(self, u, p, rho, metadata=None):
+        if u.shape[1] < 2:
+            raise ValueError(f"Only-u residuals expect at least 2 velocity channels, got {u.shape[1]}.")
+        u = u[:, :2]
+        ux = u[:, 0:1]
+        uy = u[:, 1:2]
+        p_scalar = self._pressure_scalar(p)
+        rho_scalar = rho.mean(dim=1, keepdim=True).clamp_min(1e-4)
+
+        dux_dx = self._grad_width(ux)
+        dux_dy = self._grad_height(ux)
+        duy_dx = self._grad_width(uy)
+        duy_dy = self._grad_height(uy)
+        div_u = dux_dx + duy_dy
+
+        rho_t = self._temporal_derivative(rho_scalar, metadata=metadata, order=1)
+        mass_residual_field = rho_t + self._grad_width(rho_scalar * ux) + self._grad_height(rho_scalar * uy)
+        mass_residual = self._weighted_square_mean(
+            mass_residual_field,
+            metadata=metadata,
+            ref_tensor=rho_scalar,
+        )
+
+        u_t = self._temporal_derivative(u, metadata=metadata, order=1)
+        conv_x = ux * dux_dx + uy * dux_dy
+        conv_y = ux * duy_dx + uy * duy_dy
+        grad_px = self._grad_width(p_scalar)
+        grad_py = self._grad_height(p_scalar)
+        lap_u = self._laplacian_field(u, metadata=metadata)
+        viscosity = 1e-3
+        momentum_field = torch.cat(
+            [
+                u_t[:, 0:1] + conv_x + grad_px / rho_scalar - viscosity * lap_u[:, 0:1],
+                u_t[:, 1:2] + conv_y + grad_py / rho_scalar - viscosity * lap_u[:, 1:2],
+            ],
+            dim=1,
+        )
+        momentum_residual = self._weighted_square_mean(
+            momentum_field,
+            metadata=metadata,
+            ref_tensor=u,
+        )
+
+        pressure_smoothness = self._spatial_gradient_energy(p_scalar, metadata=metadata)
+        density_smoothness = self._spatial_gradient_energy(rho_scalar, metadata=metadata)
+        density_floor = self._weighted_square_mean(
+            torch.relu(1e-4 - rho_scalar),
+            metadata=metadata,
+            ref_tensor=rho_scalar,
+        )
+
+        return {
+            "u": u,
+            "p_scalar": p_scalar,
+            "rho_scalar": rho_scalar,
+            "div_u": div_u,
+            "mass_residual": mass_residual,
+            "momentum_residual": momentum_residual,
+            "pressure_smoothness": pressure_smoothness,
+            "density_smoothness": density_smoothness,
+            "density_floor": density_floor,
+        }
+
+    def _only_u_fluid_residual(self, u, p, rho, metadata=None, prefix="fluid"):
+        scales = self._conditioned_scales(metadata, u)
+        terms = self._only_u_fluid_terms(u, p, rho, metadata=metadata)
+
+        mass_term = terms["mass_residual"] * scales["s0"]
+        momentum_term = terms["momentum_residual"] * scales["s1"]
+        pressure_smoothness = terms["pressure_smoothness"] * scales["s2"]
+        density_stability = (terms["density_smoothness"] + terms["density_floor"]) * scales["s3"]
+        total_loss = torch.clamp(
+            mass_term + momentum_term + pressure_smoothness + density_stability,
+            min=0.0,
+            max=100.0,
+        )
+        return total_loss, {
+            "mass_residual": float(terms["mass_residual"].detach().item()),
+            "momentum_residual": float(terms["momentum_residual"].detach().item()),
+            "rho_mean": float(terms["rho_scalar"].detach().mean().item()),
+            "rho_min": float(terms["rho_scalar"].detach().min().item()),
+            "p_abs_mean": float(terms["p_scalar"].detach().abs().mean().item()),
+            "div_u_abs_mean": float(terms["div_u"].detach().abs().mean().item()),
+            f"{prefix}_mass_residual": float(mass_term.detach().item()),
+            f"{prefix}_momentum_residual": float(momentum_term.detach().item()),
+            f"{prefix}_pressure_smoothness": float(pressure_smoothness.detach().item()),
+            f"{prefix}_density_stability": float(density_stability.detach().item()),
+            "cond_s0": float(scales["s0"].detach().item()),
+            "cond_s1": float(scales["s1"].detach().item()),
+            "cond_s2": float(scales["s2"].detach().item()),
+            "cond_s3": float(scales["s3"].detach().item()),
+            **self._field_family_diagnostics(
+                {"u": terms["u"], "p": p, "rho": rho},
+                metadata=metadata,
+            ),
+        }
+
+    def _coerce_field_dict(self, primary, secondary=None):
+        if isinstance(primary, dict):
+            return primary
+        if isinstance(secondary, dict):
+            return secondary
+
+        candidate = None
+        for tensor in (primary, secondary):
+            if isinstance(tensor, torch.Tensor) and tensor.ndim >= 5 and tensor.shape[1] == PHYSICS_ATTR_DIM:
+                candidate = tensor
+                break
+        if candidate is None:
+            raise RuntimeError(
+                "Explicit attribute-bank PDE residuals require a [B, 32, T, H, W] tensor or field dict input."
+            )
+        return split_attribute_bank(candidate)
+
+    @staticmethod
+    def _field_mean(field):
+        return field.mean(dim=1, keepdim=True)
+
+    def _default_frame_delta_t(self, ref_tensor):
+        time_dim = int(ref_tensor.shape[2]) if ref_tensor.ndim >= 3 else 1
+        return 1.0 / max(time_dim - 1, 1)
+
+    def _metadata_frame_delta_t(self, metadata, ref_tensor):
+        batch_size = ref_tensor.shape[0]
+        device = ref_tensor.device
+        dtype = ref_tensor.dtype
+        default_delta_t = self._default_frame_delta_t(ref_tensor)
+
+        if isinstance(metadata, dict):
+            raw_value = metadata.get("frame_delta_t")
+            if isinstance(raw_value, torch.Tensor):
+                frame_delta_t = raw_value.to(device=device, dtype=dtype).view(-1)
+                if frame_delta_t.numel() == 1 and batch_size > 1:
+                    frame_delta_t = frame_delta_t.repeat(batch_size)
+                elif frame_delta_t.numel() != batch_size:
+                    frame_delta_t = frame_delta_t[:1].repeat(batch_size)
+                fallback = torch.full_like(frame_delta_t, float(default_delta_t))
+                return torch.where(frame_delta_t > 0, frame_delta_t, fallback)
+            if isinstance(raw_value, (int, float)) and float(raw_value) > 0:
+                return torch.full(
+                    (batch_size,),
+                    float(raw_value),
+                    device=device,
+                    dtype=dtype,
+                )
+
+        return torch.full(
+            (batch_size,),
+            float(default_delta_t),
+            device=device,
+            dtype=dtype,
+        )
+
+    def _metadata_frame_time_grid(self, metadata, ref_tensor):
+        batch_size = ref_tensor.shape[0]
+        time_dim = int(ref_tensor.shape[2]) if ref_tensor.ndim >= 3 else 1
+        device = ref_tensor.device
+        dtype = ref_tensor.dtype
+
+        base_grid = torch.linspace(
+            0.0,
+            1.0,
+            steps=max(time_dim, 1),
+            device=device,
+            dtype=dtype,
+        )
+        if time_dim <= 1:
+            base_grid = torch.zeros(1, device=device, dtype=dtype)
+
+        if isinstance(metadata, dict):
+            raw_grid = metadata.get("frame_time_grid")
+            if isinstance(raw_grid, torch.Tensor):
+                frame_time_grid = raw_grid.to(device=device, dtype=dtype)
+                if frame_time_grid.ndim == 1:
+                    frame_time_grid = frame_time_grid.unsqueeze(0)
+                elif frame_time_grid.ndim > 2:
+                    frame_time_grid = frame_time_grid.view(frame_time_grid.shape[0], -1)
+
+                if frame_time_grid.shape[0] == 1 and batch_size > 1:
+                    frame_time_grid = frame_time_grid.repeat(batch_size, 1)
+                elif frame_time_grid.shape[0] != batch_size:
+                    frame_time_grid = frame_time_grid[:1].repeat(batch_size, 1)
+
+                if frame_time_grid.shape[1] == time_dim:
+                    return frame_time_grid
+
+        return base_grid.unsqueeze(0).repeat(batch_size, 1)
+
+    def _time_semantics_metrics(self, metadata, ref_tensor):
+        frame_delta_t = self._metadata_frame_delta_t(metadata, ref_tensor)
+        frame_time_grid = self._metadata_frame_time_grid(metadata, ref_tensor)
+        if frame_time_grid.shape[1] > 1:
+            frame_time_span = frame_time_grid[:, -1] - frame_time_grid[:, 0]
+        else:
+            frame_time_span = torch.zeros(
+                frame_time_grid.shape[0],
+                device=frame_time_grid.device,
+                dtype=frame_time_grid.dtype,
+            )
+        time_source_flag = 1.0 if isinstance(metadata, dict) and metadata.get("physics_time_source") == "video_frames" else 0.0
+        return {
+            "frame_delta_t": float(frame_delta_t.detach().float().mean().item()),
+            "frame_time_span": float(frame_time_span.detach().float().mean().item()),
+            "frame_count": float(frame_time_grid.shape[1]),
+            "physics_time_source_video_frames": float(time_source_flag),
+        }
+
+    def _temporal_derivative(self, field, metadata=None, order=1):
+        if order not in (1, 2):
+            raise ValueError(f"Unsupported temporal derivative order: {order}")
+        if field.ndim != 5:
+            raise ValueError(
+                f"Temporal derivatives expect [B, C, T, H, W] tensors; got {tuple(field.shape)}."
+            )
+
+        field = torch.clamp(field, min=-10.0, max=10.0)
+        result = torch.zeros_like(field)
+        time_dim = field.shape[2]
+        if time_dim <= 1:
+            return result
+
+        frame_delta_t = self._metadata_frame_delta_t(metadata, field).view(field.shape[0], 1, 1, 1, 1)
+        frame_delta_t = torch.clamp(frame_delta_t, min=1e-6)
+
+        if order == 1:
+            if time_dim == 2:
+                edge = (field[:, :, 1:2] - field[:, :, 0:1]) / frame_delta_t
+                result[:, :, 0:1] = edge
+                result[:, :, 1:2] = edge
+            else:
+                result[:, :, 1:-1] = (field[:, :, 2:] - field[:, :, :-2]) / (2.0 * frame_delta_t)
+                result[:, :, 0:1] = (
+                    -3.0 * field[:, :, 0:1]
+                    + 4.0 * field[:, :, 1:2]
+                    - field[:, :, 2:3]
+                ) / (2.0 * frame_delta_t)
+                result[:, :, -1:] = (
+                    3.0 * field[:, :, -1:]
+                    - 4.0 * field[:, :, -2:-1]
+                    + field[:, :, -3:-2]
+                ) / (2.0 * frame_delta_t)
+        else:
+            frame_delta_t_sq = frame_delta_t * frame_delta_t
+            if time_dim == 2:
+                return result
+            if time_dim == 3:
+                center = (
+                    field[:, :, 2:3]
+                    - 2.0 * field[:, :, 1:2]
+                    + field[:, :, 0:1]
+                ) / frame_delta_t_sq
+                result[:, :, 0:1] = center
+                result[:, :, 1:2] = center
+                result[:, :, 2:3] = center
+            else:
+                result[:, :, 1:-1] = (
+                    field[:, :, 2:]
+                    - 2.0 * field[:, :, 1:-1]
+                    + field[:, :, :-2]
+                ) / frame_delta_t_sq
+                result[:, :, 0:1] = (
+                    2.0 * field[:, :, 0:1]
+                    - 5.0 * field[:, :, 1:2]
+                    + 4.0 * field[:, :, 2:3]
+                    - field[:, :, 3:4]
+                ) / frame_delta_t_sq
+                result[:, :, -1:] = (
+                    2.0 * field[:, :, -1:]
+                    - 5.0 * field[:, :, -2:-1]
+                    + 4.0 * field[:, :, -3:-2]
+                    - field[:, :, -4:-3]
+                ) / frame_delta_t_sq
+
+        return torch.clamp(result, min=-100.0, max=100.0)
+
+    def _field_family_diagnostics(self, fields, metadata=None):
+        if not fields:
+            return {}
+
+        info = {}
+        total_temporal_energy = 0.0
+        total_spatial_energy = 0.0
+
+        with torch.no_grad():
+            for field_name, field in fields.items():
+                field_ref = field.detach()
+                dt = self._temporal_derivative(field_ref, metadata=metadata, order=1)
+                ddt = self._temporal_derivative(field_ref, metadata=metadata, order=2)
+                temporal_energy = self._weighted_square_mean(
+                    dt,
+                    metadata=metadata,
+                    ref_tensor=field_ref,
+                ) + self._weighted_square_mean(
+                    ddt,
+                    metadata=metadata,
+                    ref_tensor=field_ref,
+                )
+                spatial_energy = self._spatial_gradient_energy(field_ref, metadata=metadata)
+                dt_norm = self._weighted_mean(
+                    torch.abs(dt),
+                    metadata=metadata,
+                    ref_tensor=field_ref,
+                )
+                ddt_norm = self._weighted_mean(
+                    torch.abs(ddt),
+                    metadata=metadata,
+                    ref_tensor=field_ref,
+                )
+
+                safe_name = str(field_name).strip().lower()
+                info[f"temporal_dt_norm_{safe_name}"] = float(dt_norm.detach().item())
+                info[f"temporal_ddt_norm_{safe_name}"] = float(ddt_norm.detach().item())
+                info[f"spatial_energy_{safe_name}"] = float(spatial_energy.detach().item())
+                total_temporal_energy += float(temporal_energy.detach().item())
+                total_spatial_energy += float(spatial_energy.detach().item())
+
+        info["temporal_energy_total"] = float(total_temporal_energy)
+        info["spatial_energy_total"] = float(total_spatial_energy)
+        info["temporal_to_spatial_energy_ratio"] = float(
+            total_temporal_energy / max(total_spatial_energy, 1e-8)
+        )
+        info.update(self._time_semantics_metrics(metadata, next(iter(fields.values()))))
+        return info
+
+    def _temporal_alignment_loss(self, source, target, metadata=None):
+        if target.shape[2] <= 1:
+            return self._zero_loss(target)
+        source_dt = self._temporal_derivative(source, metadata=metadata, order=1)
+        target_ref = target.to(dtype=source_dt.dtype)
+        return self._weighted_square_mean(source_dt - target_ref, metadata=metadata, ref_tensor=target_ref)
+
+    def _field_match_loss(self, lhs, rhs, metadata=None):
+        lhs_scalar = self._field_mean(lhs)
+        rhs_scalar = self._field_mean(rhs)
+        return self._weighted_square_mean(lhs_scalar - rhs_scalar, metadata=metadata, ref_tensor=lhs_scalar)
+
+    def _wave_equation_loss(self, field, metadata=None):
+        second_dt = self._temporal_derivative(field, metadata=metadata, order=2)
+        lap = self._laplacian_field(field, metadata=metadata)
+        wave_residual = second_dt + lap
+        return self._weighted_square_mean(wave_residual, metadata=metadata, ref_tensor=field)
+
     def set_conditioning_enabled(self, enabled=True):
         """启用/禁用 metadata 条件化调制"""
         self.enable_conditioning = bool(enabled)
@@ -357,8 +764,7 @@ class MaterialPDEResiduals(nn.Module):
     def _ensure_finite_loss(self, loss, info, method_name="unknown"):
         """Ensure loss and info values are finite"""
         if torch.isnan(loss) or torch.isinf(loss):
-            print(f"[WARNING] NaN/Inf in {method_name}, clamping to 0")
-            loss = torch.zeros_like(loss)
+            self._raise_invalid(method_name, loss)
         else:
             loss = torch.clamp(loss, min=0.0, max=100.0)
 
@@ -643,7 +1049,7 @@ class MaterialPDEResiduals(nn.Module):
         # Ensure finite
         total_loss = torch.clamp(total_loss, min=0.0, max=100.0)
         if torch.isnan(total_loss) or torch.isinf(total_loss):
-            total_loss = torch.zeros_like(total_loss)
+            self._raise_invalid("rigid_body_motion_residual.total_loss", total_loss)
 
         info = dict(base_info)
         info.update({
@@ -675,7 +1081,7 @@ class MaterialPDEResiduals(nn.Module):
         base_loss, base_info = self._base_fluid_terms(z, v, metadata=metadata)
         base_loss = torch.clamp(base_loss, min=0.0, max=100.0)
         if torch.isnan(base_loss) or torch.isinf(base_loss):
-            base_loss = torch.zeros_like(base_loss)
+            self._raise_invalid("liquid_motion_residual.base_loss", base_loss)
 
         scales = self._conditioned_scales(metadata, v)
         field = self._scalar_field(v)
@@ -685,14 +1091,14 @@ class MaterialPDEResiduals(nn.Module):
             surface_transport = self._weighted_square_mean(field_dt, metadata=metadata, ref_tensor=v) * 0.05 * scales["s2"]
             surface_transport = torch.clamp(surface_transport, min=0.0, max=100.0)
             if torch.isnan(surface_transport) or torch.isinf(surface_transport):
-                surface_transport = torch.zeros_like(surface_transport)
+                self._raise_invalid("liquid_motion_residual.surface_transport", surface_transport)
         else:
             surface_transport = self._zero_loss(v)
 
         total_loss = base_loss + surface_transport
         total_loss = torch.clamp(total_loss, min=0.0, max=100.0)
         if torch.isnan(total_loss) or torch.isinf(total_loss):
-            total_loss = torch.zeros_like(total_loss)
+            self._raise_invalid("liquid_motion_residual.total_loss", total_loss)
 
         info = dict(base_info)
         info["surface_transport"] = float(surface_transport.detach().item()) if not (torch.isnan(surface_transport) or torch.isinf(surface_transport)) else 0.0
@@ -928,317 +1334,305 @@ class MaterialPDEResiduals(nn.Module):
     # 10 Physics-Based Phenomenon Residuals (Aligned with Table 1)
     # ========================================================================
 
-    def rigid_body_residual(self, z, v, t=None, metadata=None):
-        """
-        1. Rigid Body: s0||sym(∇u)||² + s1||Δu||²
-        Strain minimization + smoothness
-        """
+    def rigid_body_residual(self, fields_or_bank, v=None, t=None, metadata=None):
         del t
-        scales = self._conditioned_scales(metadata, v)
+        fields = self._coerce_field_dict(fields_or_bank, v)
+        d, u, eps, sigma = (fields[name] for name in EXPERT_FIELD_RECIPES["Rigid Body"])
+        scales = self._conditioned_scales(metadata, u)
 
-        # sym(∇u): strain rate (symmetric gradient)
-        strain = self._spatial_gradient_energy(v, metadata=metadata)
-        strain_term = strain * scales["s0"]
+        kinematic = self._temporal_alignment_loss(d, u, metadata=metadata) * scales["s0"]
+        strain_energy = self._weighted_square_mean(eps, metadata=metadata, ref_tensor=eps) * scales["s1"]
+        stress_strain = self._field_match_loss(sigma, eps, metadata=metadata) * scales["s2"]
+        rigid_velocity = self._spatial_gradient_energy(u, metadata=metadata) * scales["s3"]
 
-        # Δu: Laplacian smoothness
-        lap = self._laplacian_field(v, metadata=metadata)
-        smoothness = self._weighted_square_mean(lap, metadata=metadata, ref_tensor=v) * scales["s1"]
-
-        total_loss = strain_term + smoothness
-        total_loss = torch.clamp(total_loss, min=0.0, max=100.0)
-
+        total_loss = torch.clamp(kinematic + strain_energy + stress_strain + rigid_velocity, min=0.0, max=100.0)
         return total_loss, {
-            "rigid_strain": float(strain_term.detach().item()),
-            "rigid_smoothness": float(smoothness.detach().item()),
-            "cond_s0": float(scales["s0"].detach().item()),
-            "cond_s1": float(scales["s1"].detach().item()),
-        }
-
-    def elastic_residual(self, z, v, t=None, metadata=None):
-        """
-        2. Elastic: s0||Δu||² + s1||∂²u/∂t²||² + s2||sym(∇u)||²
-        Wave dynamics + strain
-        """
-        del t
-        scales = self._conditioned_scales(metadata, v)
-
-        # Δu: spatial smoothness
-        lap = self._laplacian_field(v, metadata=metadata)
-        smoothness = self._weighted_square_mean(lap, metadata=metadata, ref_tensor=v) * scales["s0"]
-
-        # ∂²u/∂t²: acceleration (wave dynamics)
-        second_dt = self._temporal_difference(v, order=2)
-        if second_dt is not None:
-            wave_dynamics = self._weighted_square_mean(second_dt, metadata=metadata, ref_tensor=v) * scales["s1"]
-        else:
-            wave_dynamics = self._zero_loss(v)
-
-        # sym(∇u): strain
-        strain = self._spatial_gradient_energy(v, metadata=metadata) * scales["s2"]
-
-        total_loss = smoothness + wave_dynamics + strain
-        total_loss = torch.clamp(total_loss, min=0.0, max=100.0)
-
-        return total_loss, {
-            "elastic_smoothness": float(smoothness.detach().item()),
-            "elastic_wave": float(wave_dynamics.detach().item()),
-            "elastic_strain": float(strain.detach().item()),
+            "rigid_kinematic": float(kinematic.detach().item()),
+            "rigid_strain_energy": float(strain_energy.detach().item()),
+            "rigid_stress_strain": float(stress_strain.detach().item()),
+            "rigid_velocity_smoothness": float(rigid_velocity.detach().item()),
             "cond_s0": float(scales["s0"].detach().item()),
             "cond_s1": float(scales["s1"].detach().item()),
             "cond_s2": float(scales["s2"].detach().item()),
+            "cond_s3": float(scales["s3"].detach().item()),
+            **self._field_family_diagnostics({"d": d, "u": u}, metadata=metadata),
         }
 
-    def fluid_residual(self, z, v, t=None, metadata=None):
-        """
-        3. Fluid: s0|∇·u|² + s1·ν||∇u||² + s2|∇×u|²
-        Continuity + viscosity + vorticity
-        """
+    def elastic_residual(self, fields_or_bank, v=None, t=None, metadata=None):
         del t
-        scales = self._conditioned_scales(metadata, v)
+        fields = self._coerce_field_dict(fields_or_bank, v)
+        d, u, eps, sigma = (fields[name] for name in EXPERT_FIELD_RECIPES["Elastic"])
+        scales = self._conditioned_scales(metadata, u)
 
-        # ∇·u: divergence (continuity)
-        div = self._divergence_field(v)
-        continuity = self._weighted_square_mean(div, metadata=metadata, ref_tensor=v) * scales["s0"]
+        elastic_wave = self._wave_equation_loss(d, metadata=metadata) * scales["s0"]
+        velocity_wave = self._wave_equation_loss(u, metadata=metadata) * scales["s1"]
+        strain_match = self._field_match_loss(eps, d, metadata=metadata) * scales["s2"]
+        stress_strain = self._field_match_loss(sigma, eps, metadata=metadata) * scales["s3"]
 
-        # ||∇u||²: velocity gradient (viscosity)
-        viscosity = self._spatial_gradient_energy(v, metadata=metadata) * scales["s1"]
+        total_loss = torch.clamp(elastic_wave + velocity_wave + strain_match + stress_strain, min=0.0, max=100.0)
+        return total_loss, {
+            "elastic_displacement_wave": float(elastic_wave.detach().item()),
+            "elastic_velocity_wave": float(velocity_wave.detach().item()),
+            "elastic_strain_match": float(strain_match.detach().item()),
+            "elastic_stress_strain": float(stress_strain.detach().item()),
+            "cond_s0": float(scales["s0"].detach().item()),
+            "cond_s1": float(scales["s1"].detach().item()),
+            "cond_s2": float(scales["s2"].detach().item()),
+            "cond_s3": float(scales["s3"].detach().item()),
+            **self._field_family_diagnostics({"d": d, "u": u}, metadata=metadata),
+        }
 
-        # ∇×u: vorticity (curl)
-        vorticity = self._vorticity_field(v)
-        vorticity_term = self._weighted_square_mean(vorticity, metadata=metadata, ref_tensor=v) * scales["s2"]
+    def fluid_residual(self, fields_or_bank, v=None, t=None, metadata=None):
+        del t
+        fields = self._coerce_field_dict(fields_or_bank, v)
+        u, p, rho = (fields[name] for name in EXPERT_FIELD_RECIPES["Fluid"])
+        if u.shape[1] == 2:
+            return self._only_u_fluid_residual(u, p, rho, metadata=metadata, prefix="fluid")
+        scales = self._conditioned_scales(metadata, u)
 
-        total_loss = continuity + viscosity + vorticity_term
-        total_loss = torch.clamp(total_loss, min=0.0, max=100.0)
+        rho_dt = self._temporal_derivative(rho, metadata=metadata, order=1)
+        div_u = self._divergence_field(u)
+        continuity = self._weighted_square_mean(
+            self._field_mean(rho_dt) + div_u,
+            metadata=metadata,
+            ref_tensor=div_u,
+        ) * scales["s0"]
+        pressure_smoothness = self._weighted_square_mean(
+            self._laplacian_field(p, metadata=metadata), metadata=metadata, ref_tensor=p
+        ) * scales["s1"]
+        vorticity_term = self._weighted_square_mean(
+            self._vorticity_field(u), metadata=metadata, ref_tensor=u
+        ) * scales["s2"]
+        density_pressure = self._field_match_loss(rho, p, metadata=metadata) * scales["s3"]
 
+        total_loss = torch.clamp(continuity + pressure_smoothness + vorticity_term + density_pressure, min=0.0, max=100.0)
         return total_loss, {
             "fluid_continuity": float(continuity.detach().item()),
-            "fluid_viscosity": float(viscosity.detach().item()),
+            "fluid_pressure_smoothness": float(pressure_smoothness.detach().item()),
             "fluid_vorticity": float(vorticity_term.detach().item()),
+            "fluid_density_pressure": float(density_pressure.detach().item()),
             "cond_s0": float(scales["s0"].detach().item()),
             "cond_s1": float(scales["s1"].detach().item()),
             "cond_s2": float(scales["s2"].detach().item()),
+            "cond_s3": float(scales["s3"].detach().item()),
+            **self._field_family_diagnostics({"u": u, "p": p, "rho": rho}, metadata=metadata),
         }
 
-    def compressible_flow_residual(self, z, v, t=None, metadata=None):
-        """
-        4. Compressible Flow: s0|∇·u|² + s1||∂t(∇·u)||² + s2||∇u||²
-        Mass conservation + dynamics
-        """
+    def compressible_flow_residual(self, fields_or_bank, v=None, t=None, metadata=None):
         del t
-        scales = self._conditioned_scales(metadata, v)
+        fields = self._coerce_field_dict(fields_or_bank, v)
+        u, p, rho = (fields[name] for name in EXPERT_FIELD_RECIPES["Compressible Flow"])
+        if u.shape[1] == 2:
+            return self._only_u_fluid_residual(u, p, rho, metadata=metadata, prefix="compressible")
+        scales = self._conditioned_scales(metadata, u)
 
-        # ∇·u: divergence (mass conservation)
-        div = self._divergence_field(v)
-        mass_conservation = self._weighted_square_mean(div, metadata=metadata, ref_tensor=v) * scales["s0"]
+        div_u = self._divergence_field(u)
+        rho_dt = self._temporal_derivative(rho, metadata=metadata, order=1)
+        mass_conservation = self._weighted_square_mean(
+            self._field_mean(rho_dt) + div_u,
+            metadata=metadata,
+            ref_tensor=div_u,
+        ) * scales["s0"]
+        div_dt = self._temporal_derivative(div_u, metadata=metadata, order=1)
+        compression_dynamics = self._weighted_square_mean(
+            div_dt,
+            metadata=metadata,
+            ref_tensor=div_u,
+        ) * scales["s1"]
+        pressure_density = self._field_match_loss(p, rho, metadata=metadata) * scales["s2"]
+        grad = self._spatial_gradient_energy(u, metadata=metadata) * scales["s3"]
 
-        # ∂t(∇·u): rate of compression/expansion
-        div_dt = self._temporal_difference(div, order=1)
-        if div_dt is not None:
-            compression_dynamics = self._weighted_square_mean(div_dt, metadata=metadata, ref_tensor=v) * scales["s1"]
-        else:
-            compression_dynamics = self._zero_loss(v)
-
-        # ||∇u||²: velocity gradient
-        grad = self._spatial_gradient_energy(v, metadata=metadata) * scales["s2"]
-
-        total_loss = mass_conservation + compression_dynamics + grad
-        total_loss = torch.clamp(total_loss, min=0.0, max=100.0)
-
+        total_loss = torch.clamp(mass_conservation + compression_dynamics + pressure_density + grad, min=0.0, max=100.0)
         return total_loss, {
             "compressible_mass": float(mass_conservation.detach().item()),
             "compressible_dynamics": float(compression_dynamics.detach().item()),
+            "compressible_pressure_density": float(pressure_density.detach().item()),
             "compressible_gradient": float(grad.detach().item()),
             "cond_s0": float(scales["s0"].detach().item()),
             "cond_s1": float(scales["s1"].detach().item()),
             "cond_s2": float(scales["s2"].detach().item()),
+            "cond_s3": float(scales["s3"].detach().item()),
+            **self._field_family_diagnostics({"u": u, "p": p, "rho": rho}, metadata=metadata),
         }
 
-    def phase_change_residual(self, z, v, t=None, metadata=None):
-        """
-        5. Phase Change: s0|∇·u|² + s1||∂t u||² + s2||Δu||²
-        Expansion + latent heat effects
-        """
+    def phase_change_residual(self, fields_or_bank, v=None, t=None, metadata=None):
         del t
-        scales = self._conditioned_scales(metadata, v)
+        fields = self._coerce_field_dict(fields_or_bank, v)
+        u, rho, T, alpha = (fields[name] for name in EXPERT_FIELD_RECIPES["Phase Change"])
+        scales = self._conditioned_scales(metadata, u)
 
-        # ∇·u: volumetric expansion/contraction
-        div = self._divergence_field(v)
-        expansion = self._weighted_square_mean(div, metadata=metadata, ref_tensor=v) * scales["s0"]
+        alpha_dt = self._temporal_derivative(alpha, metadata=metadata, order=1)
+        div_u = self._divergence_field(u)
+        expansion = self._weighted_square_mean(
+            self._field_mean(alpha_dt) + div_u,
+            metadata=metadata,
+            ref_tensor=div_u,
+        ) * scales["s0"]
+        temp_dt = self._temporal_derivative(T, metadata=metadata, order=1)
+        latent_heat = self._weighted_square_mean(temp_dt, metadata=metadata, ref_tensor=T) * scales["s1"]
+        temperature_smoothness = self._weighted_square_mean(
+            self._laplacian_field(T, metadata=metadata), metadata=metadata, ref_tensor=T
+        ) * scales["s2"]
+        density_phase = self._field_match_loss(rho, alpha, metadata=metadata) * scales["s3"]
 
-        # ∂t u: rate of change (latent heat transfer)
-        first_dt = self._temporal_difference(v, order=1)
-        if first_dt is not None:
-            latent_heat = self._weighted_square_mean(first_dt, metadata=metadata, ref_tensor=v) * scales["s1"]
-        else:
-            latent_heat = self._zero_loss(v)
-
-        # Δu: spatial smoothness (phase boundary)
-        lap = self._laplacian_field(v, metadata=metadata)
-        smoothness = self._weighted_square_mean(lap, metadata=metadata, ref_tensor=v) * scales["s2"]
-
-        total_loss = expansion + latent_heat + smoothness
-        total_loss = torch.clamp(total_loss, min=0.0, max=100.0)
-
+        total_loss = torch.clamp(expansion + latent_heat + temperature_smoothness + density_phase, min=0.0, max=100.0)
         return total_loss, {
             "phase_expansion": float(expansion.detach().item()),
             "phase_latent_heat": float(latent_heat.detach().item()),
-            "phase_smoothness": float(smoothness.detach().item()),
+            "phase_temperature_smoothness": float(temperature_smoothness.detach().item()),
+            "phase_density_alpha": float(density_phase.detach().item()),
             "cond_s0": float(scales["s0"].detach().item()),
             "cond_s1": float(scales["s1"].detach().item()),
             "cond_s2": float(scales["s2"].detach().item()),
+            "cond_s3": float(scales["s3"].detach().item()),
+            **self._field_family_diagnostics({"u": u, "rho": rho, "temperature": T, "alpha": alpha}, metadata=metadata),
         }
 
-    def collision_contact_residual(self, z, v, t=None, metadata=None):
-        """
-        6. Collision/Contact: s0|∇·u|² + s1||∂t u||² + s2||∇²u||²
-        Momentum exchange + acceleration
-        """
+    def collision_contact_residual(self, fields_or_bank, v=None, t=None, metadata=None):
         del t
-        scales = self._conditioned_scales(metadata, v)
+        fields = self._coerce_field_dict(fields_or_bank, v)
+        d, u, j = (fields[name] for name in EXPERT_FIELD_RECIPES["Collision/Contact"])
+        scales = self._conditioned_scales(metadata, u)
 
-        # ∇·u: compression at contact point
-        div = self._divergence_field(v)
-        compression = self._weighted_square_mean(div, metadata=metadata, ref_tensor=v) * scales["s0"]
+        kinematic = self._temporal_alignment_loss(d, u, metadata=metadata) * scales["s0"]
+        impulse_exchange = self._temporal_alignment_loss(u, j, metadata=metadata) * scales["s1"]
+        contact_compression = self._weighted_square_mean(
+            self._divergence_field(d) + self._field_mean(j),
+            metadata=metadata,
+            ref_tensor=d,
+        ) * scales["s2"]
+        impact_propagation = self._weighted_square_mean(
+            self._laplacian_field(j, metadata=metadata), metadata=metadata, ref_tensor=j
+        ) * scales["s3"]
 
-        # ∂t u: acceleration (momentum exchange)
-        first_dt = self._temporal_difference(v, order=1)
-        if first_dt is not None:
-            acceleration = self._weighted_square_mean(first_dt, metadata=metadata, ref_tensor=v) * scales["s1"]
-        else:
-            acceleration = self._zero_loss(v)
-
-        # ∇²u: second-order spatial (impact propagation)
-        second_grad = self._laplacian_field(v, metadata=metadata)
-        impact = self._weighted_square_mean(second_grad, metadata=metadata, ref_tensor=v) * scales["s2"]
-
-        total_loss = compression + acceleration + impact
-        total_loss = torch.clamp(total_loss, min=0.0, max=100.0)
-
+        total_loss = torch.clamp(kinematic + impulse_exchange + contact_compression + impact_propagation, min=0.0, max=100.0)
         return total_loss, {
-            "collision_compression": float(compression.detach().item()),
-            "collision_acceleration": float(acceleration.detach().item()),
-            "collision_impact": float(impact.detach().item()),
+            "collision_kinematic": float(kinematic.detach().item()),
+            "collision_impulse_exchange": float(impulse_exchange.detach().item()),
+            "collision_compression": float(contact_compression.detach().item()),
+            "collision_impact": float(impact_propagation.detach().item()),
             "cond_s0": float(scales["s0"].detach().item()),
             "cond_s1": float(scales["s1"].detach().item()),
             "cond_s2": float(scales["s2"].detach().item()),
+            "cond_s3": float(scales["s3"].detach().item()),
+            **self._field_family_diagnostics({"d": d, "u": u, "j": j}, metadata=metadata),
         }
 
-    def granular_residual(self, z, v, t=None, metadata=None):
-        """
-        7. Granular: s0||∇u||² + s1||div(|u|u)||²
-        Friction + inertial effects
-        """
+    def granular_residual(self, fields_or_bank, v=None, t=None, metadata=None):
         del t
-        scales = self._conditioned_scales(metadata, v)
+        fields = self._coerce_field_dict(fields_or_bank, v)
+        u, rho, alpha, j = (fields[name] for name in EXPERT_FIELD_RECIPES["Granular"])
+        scales = self._conditioned_scales(metadata, u)
 
-        # ||∇u||²: velocity gradient (friction)
-        grad = self._spatial_gradient_energy(v, metadata=metadata) * scales["s0"]
+        grad = self._spatial_gradient_energy(u, metadata=metadata) * scales["s0"]
+        rho_dt = self._temporal_derivative(rho, metadata=metadata, order=1)
+        div_u = self._divergence_field(u)
+        transport = self._weighted_square_mean(
+            self._field_mean(rho_dt) + div_u,
+            metadata=metadata,
+            ref_tensor=div_u,
+        ) * scales["s1"]
+        packing = self._field_match_loss(rho, alpha, metadata=metadata) * scales["s2"]
+        contact_impulse = self._field_match_loss(j, u, metadata=metadata) * scales["s3"]
 
-        # div(|u|u): inertial term (nonlinear advection)
-        speed = torch.sqrt((v ** 2).sum(dim=1, keepdim=True) + 1e-10)
-        inertial_field = speed * v
-        div_inertial = self._divergence_field(inertial_field)
-        inertial = self._weighted_square_mean(div_inertial, metadata=metadata, ref_tensor=v) * scales["s1"]
-
-        total_loss = grad + inertial
-        total_loss = torch.clamp(total_loss, min=0.0, max=100.0)
-
+        total_loss = torch.clamp(grad + transport + packing + contact_impulse, min=0.0, max=100.0)
         return total_loss, {
             "granular_friction": float(grad.detach().item()),
-            "granular_inertial": float(inertial.detach().item()),
-            "cond_s0": float(scales["s0"].detach().item()),
-            "cond_s1": float(scales["s1"].detach().item()),
-        }
-
-    def fracture_residual(self, z, v, t=None, metadata=None):
-        """
-        8. Fracture: s0||∂t u||² + s1||Δu||² + s2|∇·u|
-        Energy release + crack dynamics
-        """
-        del t
-        scales = self._conditioned_scales(metadata, v)
-
-        # ∂t u: velocity (energy release rate)
-        first_dt = self._temporal_difference(v, order=1)
-        if first_dt is not None:
-            energy_release = self._weighted_square_mean(first_dt, metadata=metadata, ref_tensor=v) * scales["s0"]
-        else:
-            energy_release = self._zero_loss(v)
-
-        # Δu: crack tip singularity (Laplacian)
-        lap = self._laplacian_field(v, metadata=metadata)
-        crack_dynamics = self._weighted_square_mean(lap, metadata=metadata, ref_tensor=v) * scales["s1"]
-
-        # ∇·u: volumetric strain (crack opening)
-        div = self._divergence_field(v)
-        crack_opening = self._weighted_mean(div.abs(), metadata=metadata, ref_tensor=v) * scales["s2"]
-
-        total_loss = energy_release + crack_dynamics + crack_opening
-        total_loss = torch.clamp(total_loss, min=0.0, max=100.0)
-
-        return total_loss, {
-            "fracture_energy": float(energy_release.detach().item()),
-            "fracture_crack": float(crack_dynamics.detach().item()),
-            "fracture_opening": float(crack_opening.detach().item()),
+            "granular_transport": float(transport.detach().item()),
+            "granular_packing": float(packing.detach().item()),
+            "granular_contact_impulse": float(contact_impulse.detach().item()),
             "cond_s0": float(scales["s0"].detach().item()),
             "cond_s1": float(scales["s1"].detach().item()),
             "cond_s2": float(scales["s2"].detach().item()),
+            "cond_s3": float(scales["s3"].detach().item()),
+            **self._field_family_diagnostics({"u": u, "rho": rho, "alpha": alpha, "j": j}, metadata=metadata),
         }
 
-    def thermal_residual(self, z, v, t=None, metadata=None):
-        """
-        9. Thermal: s0||∂t T||² + s1||ΔT||²
-        Energy diffusion (applied to temperature field)
-        Note: For velocity field, we apply smoothness + temporal coherence
-        """
+    def fracture_residual(self, fields_or_bank, v=None, t=None, metadata=None):
         del t
-        scales = self._conditioned_scales(metadata, v)
+        fields = self._coerce_field_dict(fields_or_bank, v)
+        d, u, eps, sigma, j, D = (fields[name] for name in EXPERT_FIELD_RECIPES["Fracture"])
+        scales = self._conditioned_scales(metadata, u)
 
-        # ∂t v: temporal change (analogous to ∂t T)
-        first_dt = self._temporal_difference(v, order=1)
-        if first_dt is not None:
-            temporal_diffusion = self._weighted_square_mean(first_dt, metadata=metadata, ref_tensor=v) * scales["s0"]
-        else:
-            temporal_diffusion = self._zero_loss(v)
+        kinematic = self._temporal_alignment_loss(d, u, metadata=metadata) * scales["s0"]
+        strain_energy = self._weighted_square_mean(eps, metadata=metadata, ref_tensor=eps) * scales["s1"]
+        stress_strain = self._field_match_loss(sigma, eps, metadata=metadata) * scales["s2"]
+        impact_transfer = self._field_match_loss(j, u, metadata=metadata) * scales["s3"]
+        damage_dt = self._temporal_derivative(D, metadata=metadata, order=1)
+        j_scalar = torch.abs(self._field_mean(j))
+        damage_progress = self._weighted_square_mean(
+            self._field_mean(damage_dt) - j_scalar,
+            metadata=metadata,
+            ref_tensor=j_scalar,
+        )
 
-        # Δv: spatial diffusion (analogous to ΔT)
-        lap = self._laplacian_field(v, metadata=metadata)
-        spatial_diffusion = self._weighted_square_mean(lap, metadata=metadata, ref_tensor=v) * scales["s1"]
+        total_loss = torch.clamp(
+            kinematic + strain_energy + stress_strain + impact_transfer + damage_progress,
+            min=0.0,
+            max=100.0,
+        )
+        return total_loss, {
+            "fracture_kinematic": float(kinematic.detach().item()),
+            "fracture_strain_energy": float(strain_energy.detach().item()),
+            "fracture_stress_strain": float(stress_strain.detach().item()),
+            "fracture_impact_transfer": float(impact_transfer.detach().item()),
+            "fracture_damage_progress": float(damage_progress.detach().item()),
+            "cond_s0": float(scales["s0"].detach().item()),
+            "cond_s1": float(scales["s1"].detach().item()),
+            "cond_s2": float(scales["s2"].detach().item()),
+            "cond_s3": float(scales["s3"].detach().item()),
+            **self._field_family_diagnostics({"d": d, "u": u, "damage": D, "j": j}, metadata=metadata),
+        }
 
-        total_loss = temporal_diffusion + spatial_diffusion
-        total_loss = torch.clamp(total_loss, min=0.0, max=100.0)
+    def thermal_residual(self, fields_or_bank, v=None, t=None, metadata=None):
+        del t
+        fields = self._coerce_field_dict(fields_or_bank, v)
+        u, T = (fields[name] for name in EXPERT_FIELD_RECIPES["Thermal"])
+        scales = self._conditioned_scales(metadata, u)
 
+        temp_dt = self._temporal_derivative(T, metadata=metadata, order=1)
+        temporal_diffusion = self._weighted_square_mean(temp_dt, metadata=metadata, ref_tensor=T) * scales["s0"]
+        spatial_diffusion = self._weighted_square_mean(
+            self._laplacian_field(T, metadata=metadata), metadata=metadata, ref_tensor=T
+        ) * scales["s1"]
+        thermal_advection = self._weighted_square_mean(
+            self._divergence_field(u * self._field_mean(T).expand_as(u)),
+            metadata=metadata,
+            ref_tensor=u,
+        ) * scales["s2"]
+
+        total_loss = torch.clamp(temporal_diffusion + spatial_diffusion + thermal_advection, min=0.0, max=100.0)
         return total_loss, {
             "thermal_temporal": float(temporal_diffusion.detach().item()),
             "thermal_spatial": float(spatial_diffusion.detach().item()),
+            "thermal_advection": float(thermal_advection.detach().item()),
             "cond_s0": float(scales["s0"].detach().item()),
             "cond_s1": float(scales["s1"].detach().item()),
+            "cond_s2": float(scales["s2"].detach().item()),
+            **self._field_family_diagnostics({"u": u, "temperature": T}, metadata=metadata),
         }
 
-    def optical_residual(self, z, v, t=None, metadata=None):
-        """
-        10. Optical: s0||Δu||² + s1|∇·u|²
-        Wave propagation + interference
-        """
+    def optical_residual(self, fields_or_bank, v=None, t=None, metadata=None):
         del t
-        scales = self._conditioned_scales(metadata, v)
+        fields = self._coerce_field_dict(fields_or_bank, v)
+        psi, alpha = (fields[name] for name in EXPERT_FIELD_RECIPES["Optical"])
+        scales = self._conditioned_scales(metadata, psi)
 
-        # Δu: wave equation (spatial propagation)
-        lap = self._laplacian_field(v, metadata=metadata)
-        wave_propagation = self._weighted_square_mean(lap, metadata=metadata, ref_tensor=v) * scales["s0"]
+        wave_propagation = self._wave_equation_loss(psi, metadata=metadata) * scales["s0"]
+        alpha_smoothness = self._weighted_square_mean(
+            self._laplacian_field(alpha, metadata=metadata), metadata=metadata, ref_tensor=alpha
+        ) * scales["s1"]
+        interference = self._field_match_loss(psi, alpha, metadata=metadata) * scales["s2"]
 
-        # ∇·u: divergence (wave interference pattern)
-        div = self._divergence_field(v)
-        interference = self._weighted_square_mean(div, metadata=metadata, ref_tensor=v) * scales["s1"]
-
-        total_loss = wave_propagation + interference
-        total_loss = torch.clamp(total_loss, min=0.0, max=100.0)
-
+        total_loss = torch.clamp(wave_propagation + alpha_smoothness + interference, min=0.0, max=100.0)
         return total_loss, {
             "optical_wave": float(wave_propagation.detach().item()),
+            "optical_alpha_smoothness": float(alpha_smoothness.detach().item()),
             "optical_interference": float(interference.detach().item()),
             "cond_s0": float(scales["s0"].detach().item()),
             "cond_s1": float(scales["s1"].detach().item()),
+            "cond_s2": float(scales["s2"].detach().item()),
+            **self._field_family_diagnostics({"psi": psi, "alpha": alpha}, metadata=metadata),
         }
 
 

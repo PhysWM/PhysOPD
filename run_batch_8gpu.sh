@@ -32,10 +32,11 @@ fi
 
 CSV="${CSV:-videophy_test_public.csv}"
 OUTPUT_DIR="${OUTPUT_DIR:-output_videos_pinn_corrected}"
-CHECKPOINT="${CHECKPOINT:-models/train/pinn_plugin_low_noise/pinn_plugin_final.pt}"
+CHECKPOINT="${CHECKPOINT:-/home/dataset-assist-0/algorithm/cong.wang/DiffSynth-Studio/models/train/wan21_stage2_fullpinn7/step-2500.pt}"
 LOG_DIR="${LOG_DIR:-}"
 TOTAL=344
 AUTO_LABEL_FROM_PROMPT="${AUTO_LABEL_FROM_PROMPT:-1}"
+MODEL_ID="${MODEL_ID:-Wan-AI/Wan2.2-T2V-A14B}"
 
 # 每卡约 420 个，均匀分配
 CHUNK=$(( (TOTAL + 7) / 8 ))
@@ -57,6 +58,7 @@ run_one() {
         --output_dir \"$OUTPUT_DIR\" \
         --checkpoint_path \"$CHECKPOINT\" \
         --skip_existing \
+        --model_id \"$MODEL_ID\" \
         $auto_label_flag \
         \"\$@\" $log_redirect"
 }

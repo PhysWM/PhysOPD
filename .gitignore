@@ -21,3 +21,8 @@
 /examples/wanvideo/pinn_inference/__pycache__/
 /leet.py
 /output_videos_pinn_corrected/
+/codex_skills/
+phygenbench_videos_wan21_pinn_batch/
+outputs/
+output_videos_wan21_pinn_batch/
+tests/

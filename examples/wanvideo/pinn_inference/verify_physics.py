@@ -445,9 +445,9 @@ def _plot_latent_residuals(tracking: dict, output_dir: str):
 
     ax = axes[1, 0]
     ax.plot(steps, tracking["scale_history"], "g-o", markersize=4)
-    ax.set_title("adapter.scale over denoising steps\n(= learned correction strength)")
+    ax.set_title("adapter.scale over denoising steps\n(shared-slots v1 compat stat)")
     ax.set_xlabel("Denoising step")
-    ax.set_ylabel("scale value")
+    ax.set_ylabel("compat stat")
     ax.axhline(0, color="gray", linestyle="--", alpha=0.5)
     ax.grid(True, alpha=0.3)
 
@@ -474,8 +474,9 @@ def _plot_latent_residuals(tracking: dict, output_dir: str):
         reduce_pct = (1 - np.mean(tracking['div_corrected']) /
                       (np.mean(tracking['div_original']) + 1e-10)) * 100
         print(f"    Divergence reduction     = {reduce_pct:.2f}%  (正值 = PINN 确实减少了物理违约)")
-        print(f"    adapter.scale avg        = {np.mean(tracking['scale_history']):.6f}")
+        print(f"    adapter.scale avg*       = {np.mean(tracking['scale_history']):.6f}")
         print(f"    correction ratio avg     = {np.mean(tracking['correction_ratio'])*100:.4f}%")
+        print("    * shared-slots v1 中该值仅作兼容统计，不再直接门控输出修正。")
 
 
 # ─────────────────────────────────────────────────────────────────────────────

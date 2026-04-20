@@ -429,6 +429,7 @@ def launch_training_task(
     num_workers: int = 8,
     save_steps: int = None,
     num_epochs: int = 1,
+    max_steps: int = None,
     gradient_accumulation_steps: int = 1,
     find_unused_parameters: bool = False,
     ddp_timeout_seconds: int = 3600,
@@ -499,6 +500,8 @@ def launch_training_task(
     # 从恢复的 epoch 开始训练
     start_epoch = resume_epoch
     global_step_offset = resume_step
+    max_steps = None if max_steps is None else max(int(max_steps), 1)
+    stop_training = False
 
     for epoch_id in range(start_epoch, num_epochs):
         progress_bar = tqdm(dataloader, disable=not accelerator.is_local_main_process)
@@ -509,6 +512,9 @@ def launch_training_task(
             # 如果是恢复的 epoch 且 step_id 小于 resume_step 对应的 epoch 内的 step，跳过
             if epoch_id == start_epoch and current_global_step <= resume_step:
                 continue
+            if max_steps is not None and current_global_step > max_steps:
+                stop_training = True
+                break
 
             step_ready_time = time.perf_counter()
             data_wait_s = step_ready_time - last_step_end_time
@@ -529,11 +535,12 @@ def launch_training_task(
                 optimizer.zero_grad()
                 loss = model(data)
 
-                # NaN/Inf detection and protection - SKIP backward if invalid
+                # Fail fast on invalid loss instead of silently advancing scheduler/state.
                 if torch.isnan(loss) or torch.isinf(loss):
-                    print(f"[WARNING] NaN/Inf detected in loss at step {model_logger.num_steps}, skipping this step")
-                    loss_value = 0.0
-                    # Skip backward pass entirely
+                    raise FloatingPointError(
+                        f"Invalid loss detected at logger_step={model_logger.num_steps}, "
+                        f"epoch={epoch_id}, iter={step_id}."
+                    )
                 else:
                     accelerator.backward(loss)
 
@@ -597,6 +604,8 @@ def launch_training_task(
                             }
                         )
             last_step_end_time = time.perf_counter()
+        if stop_training:
+            break
         if save_steps is None:
             # 在 epoch 结束时保存，包含训练状态
             if hasattr(model_logger, 'save_training_state'):
@@ -639,6 +648,7 @@ def wan_parser():
     parser.add_argument("--model_id_with_origin_paths", type=str, default=None, help="Model ID with origin paths, e.g., Wan-AI/Wan2.1-T2V-1.3B:diffusion_pytorch_model*.safetensors. Comma-separated.")
     parser.add_argument("--learning_rate", type=float, default=1e-4, help="Learning rate.")
     parser.add_argument("--num_epochs", type=int, default=1, help="Number of epochs.")
+    parser.add_argument("--max_steps", type=int, default=None, help="Optional maximum global optimizer steps. If set, training stops after this step.")
     parser.add_argument("--output_path", type=str, default="./models", help="Output save path.")
     parser.add_argument("--remove_prefix_in_ckpt", type=str, default="pipe.dit.", help="Remove prefix in ckpt.")
     parser.add_argument("--trainable_models", type=str, default=None, help="Models to train, e.g., dit, vae, text_encoder.")

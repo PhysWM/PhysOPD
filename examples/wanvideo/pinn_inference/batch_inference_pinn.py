@@ -27,6 +27,7 @@ from diffsynth.pipelines.wan_video_pinn import PhysicsInformedWanVideoPipeline
 from diffsynth.pipelines.wan_video_new import ModelConfig
 from auto_label_utils import (
     PromptPhysicsLabelInferer,
+    PromptVideoPromptRefiner,
     build_minimal_label_metadata,
     prompt_preview,
 )
@@ -38,7 +39,10 @@ PHENOMENON_LABELS = [
     "Collision/Contact", "Granular", "Fracture", "Thermal", "Optical",
 ]
 PHENOMENON_TO_ID = {name: idx for idx, name in enumerate(PHENOMENON_LABELS)}
+PHENOMENON_NAME_LOOKUP = {name.lower(): name for name in PHENOMENON_LABELS}
 PHENOMENON_ALIAS = {}
+DEFAULT_LLM_MODEL = "gpt-5.4"
+DEFAULT_LLM_BASE_URL = "http://14.103.68.46/v1/chat/completions"
 
 
 def _safe_text(value):
@@ -137,9 +141,12 @@ def encode_raw_metadata(raw_metadata, n_text_vocab_size=2048, q_dim=64):
         label_ids = []
         for part in label_name.split(","):
             part = part.strip()
-            if part in PHENOMENON_TO_ID:
-                label_ids.append(PHENOMENON_TO_ID[part])
+            canonical_part = PHENOMENON_NAME_LOOKUP.get(part.lower())
+            if canonical_part in PHENOMENON_TO_ID:
+                label_ids.append(PHENOMENON_TO_ID[canonical_part])
         if not label_ids:
+            if label_name != "":
+                raise ValueError(f"Unknown inference label metadata: {label_name!r}")
             label_ids = [PHENOMENON_TO_ID["Fluid"]]
         label_id = int(label_ids[0])
     else:
@@ -199,6 +206,45 @@ def extract_prompt_from_row(row):
     if caption.startswith('"') and caption.endswith('"'):
         caption = caption[1:-1]
     return caption
+
+
+def build_wan_model_configs(model_id):
+    text_encoder = ModelConfig(
+        model_id=model_id,
+        origin_file_pattern="models_t5_umt5-xxl-enc-bf16.pth",
+        offload_device="cpu",
+    )
+    vae = ModelConfig(
+        model_id=model_id,
+        origin_file_pattern="Wan2.1_VAE.pth",
+        offload_device="cpu",
+    )
+
+    if "Wan2.1" in model_id:
+        return [
+            ModelConfig(
+                model_id=model_id,
+                origin_file_pattern="diffusion_pytorch_model*.safetensors",
+                offload_device="cpu",
+            ),
+            text_encoder,
+            vae,
+        ], "single_expert"
+
+    return [
+        ModelConfig(
+            model_id=model_id,
+            origin_file_pattern="high_noise_model/diffusion_pytorch_model*.safetensors",
+            offload_device="cpu",
+        ),
+        ModelConfig(
+            model_id=model_id,
+            origin_file_pattern="low_noise_model/diffusion_pytorch_model*.safetensors",
+            offload_device="cpu",
+        ),
+        text_encoder,
+        vae,
+    ], "dual_expert"
 
 
 def metadata_from_row(row):
@@ -309,9 +355,20 @@ def main():
     parser.add_argument("--num_frames", type=int, default=81)
     parser.add_argument("--num_inference_steps", type=int, default=50)
     parser.add_argument("--cfg_scale", type=float, default=5.0)
-    parser.add_argument("--seed_base", type=int, default=0, help="种子基准，实际 seed = seed_base + id")
+    parser.add_argument("--seed", type=int, default=0, help="固定随机种子，与单条 inference 保持一致")
+    parser.add_argument(
+        "--seed_base",
+        dest="seed",
+        type=int,
+        help="兼容旧参数名；当前语义已改为固定随机种子，等价于 --seed",
+    )
     parser.add_argument("--fps", type=int, default=15)
     parser.add_argument("--quality", type=int, default=5)
+    parser.add_argument(
+        "--observable_inspection_only",
+        action="store_true",
+        help="Run full Wan inference but only record encoder observable diagnostics; do not apply adapter correction to v_original.",
+    )
 
     # 设备
     parser.add_argument("--device", type=str, default="cuda")
@@ -332,13 +389,23 @@ def main():
         action="store_true",
         help="Call an OpenAI-compatible LLM API to infer routing labels when row/global metadata is absent.",
     )
-    parser.add_argument("--llm_model", type=str, default=None, help="LLM model name. Falls back to OPENAI_MODEL or LLM_MODEL.")
-    parser.add_argument("--llm_base_url", type=str, default=None, help="OpenAI-compatible base URL. Falls back to OPENAI_BASE_URL or LLM_BASE_URL.")
+    parser.add_argument("--llm_model", type=str, default=DEFAULT_LLM_MODEL, help="LLM model name. Falls back to OPENAI_MODEL or LLM_MODEL.")
+    parser.add_argument("--llm_base_url", type=str, default=DEFAULT_LLM_BASE_URL, help="OpenAI-compatible base URL. Falls back to OPENAI_BASE_URL or LLM_BASE_URL.")
     parser.add_argument("--llm_api_key", type=str, default=None, help="Optional direct API key. Prefer env vars for security.")
     parser.add_argument("--llm_api_key_env", type=str, default="OPENAI_API_KEY", help="Environment variable name that stores the API key.")
     parser.add_argument("--llm_timeout", type=float, default=30.0, help="LLM request timeout in seconds.")
     parser.add_argument("--llm_max_retries", type=int, default=2, help="Maximum retry count for LLM requests.")
+    parser.add_argument(
+        "--disable_prompt_refinement",
+        action="store_true",
+        help="Disable LLM prompt refinement and use the raw CSV caption directly.",
+    )
     parser.add_argument("--skip_existing", action="store_true", help="若输出文件已存在则跳过")
+    parser.add_argument(
+        "--continue_on_error",
+        action="store_true",
+        help="遇到单条推理失败时继续后续样本。默认关闭，失败直接中止。",
+    )
     parser.add_argument(
         "--resume",
         action="store_true",
@@ -382,42 +449,38 @@ def main():
 
     # 1. 加载模型（只加载一次）
     print("\n[1/3] Loading model...")
+    model_configs, loader_mode = build_wan_model_configs(args.model_id)
+    print(f"  Model loader mode: {loader_mode}")
     pipe = PhysicsInformedWanVideoPipeline.from_pretrained(
         torch_dtype=torch.bfloat16,
         device=args.device,
-        model_configs=[
-            ModelConfig(
-                model_id=args.model_id,
-                origin_file_pattern="high_noise_model/diffusion_pytorch_model*.safetensors",
-                offload_device="cpu",
-            ),
-            ModelConfig(
-                model_id=args.model_id,
-                origin_file_pattern="low_noise_model/diffusion_pytorch_model*.safetensors",
-                offload_device="cpu",
-            ),
-            ModelConfig(
-                model_id=args.model_id,
-                origin_file_pattern="models_t5_umt5-xxl-enc-bf16.pth",
-                offload_device="cpu",
-            ),
-            ModelConfig(
-                model_id=args.model_id,
-                origin_file_pattern="Wan2.1_VAE.pth",
-                offload_device="cpu",
-            ),
-        ],
+        model_configs=model_configs,
     )
     pipe.enable_vram_management()
 
     print(f"[2/3] Loading PINN plugin from {args.checkpoint_path}...")
-    pipe.load_pinn_plugin(args.checkpoint_path, device=args.device)
+    pipe.load_pinn_plugin(
+        args.checkpoint_path,
+        device=args.device,
+        enable_tracking=True,
+        observable_inspection_only=args.observable_inspection_only,
+    )
     global_metadata, global_mode = load_global_metadata(
         metadata_json=args.metadata_json,
         metadata_csv=args.metadata_csv,
     )
     if global_metadata is not None:
         print(f"  Using global PINN metadata (mode={global_mode}).")
+    prompt_refiner = None
+    if not args.disable_prompt_refinement:
+        prompt_refiner = PromptVideoPromptRefiner(
+            model=args.llm_model,
+            base_url=args.llm_base_url,
+            api_key=args.llm_api_key,
+            api_key_env=args.llm_api_key_env,
+            timeout=args.llm_timeout,
+            max_retries=args.llm_max_retries,
+        )
     llm_inferer = None
     if args.auto_label_from_prompt:
         llm_inferer = PromptPhysicsLabelInferer(
@@ -457,21 +520,34 @@ def main():
             print(f"  [{vid_id:4d}/{total}] Skip (exists): {out_name}")
             continue
 
-        seed = 0
+        seed = args.seed
+        original_caption = caption
+        effective_prompt = caption
+        prompt_refinement = None
+        if prompt_refiner is not None:
+            prompt_refinement = prompt_refiner.refine(caption)
+            effective_prompt = prompt_refinement.get("refined_prompt") or caption
         pinn_metadata = global_metadata
         metadata_mode = global_mode
         if pinn_metadata is None:
             pinn_metadata, metadata_mode = metadata_from_row(row)
         llm_result = None
         if pinn_metadata is None and llm_inferer is not None:
-            llm_result = llm_inferer.infer(caption)
+            llm_result = llm_inferer.infer(effective_prompt)
             pinn_metadata = build_minimal_label_metadata(
                 llm_result["labels"],
                 PHENOMENON_TO_ID,
                 default_label="Fluid",
             )
             metadata_mode = "llm_auto_label"
-        print(f"  [{vid_id:4d}/{total}] {caption[:60]}{'...' if len(caption) > 60 else ''} -> {out_name}")
+        print(f"  [{vid_id:4d}/{total}] {original_caption[:60]}{'...' if len(original_caption) > 60 else ''} -> {out_name}")
+        if prompt_refinement is not None:
+            if prompt_refinement.get("used_refinement"):
+                print(
+                    f"    refined prompt: '{prompt_preview(effective_prompt, limit=160)}'"
+                )
+            elif prompt_refinement.get("error"):
+                print(f"    prompt refine warning: {prompt_refinement['error']}")
         if pinn_metadata is not None:
             print(f"    metadata mode: {metadata_mode}")
             print(
@@ -480,15 +556,16 @@ def main():
             )
         if llm_result is not None:
             print(
-                f"    llm prompt='{prompt_preview(caption)}', raw_labels={llm_result['raw_labels']}, "
+                f"    llm prompt='{prompt_preview(effective_prompt)}', raw_labels={llm_result['raw_labels']}, "
                 f"final_labels={llm_result['labels']}, fallback={llm_result['fallback_used']}"
             )
             if llm_result.get("error"):
                 print(f"    llm warning: {llm_result['error']}")
 
         try:
+            pipe.reset_tracking()
             video = pipe(
-                prompt=caption,
+                prompt=effective_prompt,
                 negative_prompt=args.negative_prompt,
                 height=args.height,
                 width=args.width,
@@ -502,7 +579,9 @@ def main():
             save_video(video, str(out_path), fps=args.fps, quality=args.quality)
         except Exception as e:
             print(f"  [{vid_id:4d}/{total}] ERROR: {e}")
-            continue
+            if args.continue_on_error:
+                continue
+            raise
 
     print("\n" + "=" * 80)
     print(f"Done: {start_id}-{end_id}")

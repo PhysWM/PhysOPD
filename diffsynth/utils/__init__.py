@@ -194,15 +194,24 @@ class ModelConfig:
             # Download
             if self.local_model_path is None:
                 self.local_model_path = "./models"
+            local_model_root = os.path.join(self.local_model_path, self.model_id)
+            downloaded_files = glob.glob(self.origin_file_pattern, root_dir=local_model_root)
+            has_local_assets = False
+            if allow_file_pattern is None:
+                has_local_assets = os.path.isdir(local_model_root) and any(os.scandir(local_model_root))
+            else:
+                has_local_assets = len(downloaded_files) > 0
             if not skip_download:
-                downloaded_files = glob.glob(self.origin_file_pattern, root_dir=os.path.join(self.local_model_path, self.model_id))
-                snapshot_download(
-                    self.model_id,
-                    local_dir=os.path.join(self.local_model_path, self.model_id),
-                    allow_file_pattern=allow_file_pattern,
-                    ignore_file_pattern=downloaded_files,
-                    local_files_only=False
-                )
+                if has_local_assets:
+                    print(f"Found local assets for ({self.model_id}, {self.origin_file_pattern}); skipping snapshot download.")
+                else:
+                    snapshot_download(
+                        self.model_id,
+                        local_dir=local_model_root,
+                        allow_file_pattern=allow_file_pattern,
+                        ignore_file_pattern=downloaded_files,
+                        local_files_only=False
+                    )
             
             # Let rank 1, 2, ... wait for rank 0
             if use_usp:

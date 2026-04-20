@@ -23,6 +23,7 @@ from diffsynth.pipelines.wan_video_pinn import PhysicsInformedWanVideoPipeline
 from diffsynth.pipelines.wan_video_new import ModelConfig
 from auto_label_utils import (
     PromptPhysicsLabelInferer,
+    PromptVideoPromptRefiner,
     build_minimal_label_metadata,
     prompt_preview,
 )
@@ -216,6 +217,45 @@ def load_inference_metadata(metadata_json=None, metadata_csv=None):
     return metadata, "raw_encoded"
 
 
+def build_wan_model_configs(model_id):
+    text_encoder = ModelConfig(
+        model_id=model_id,
+        origin_file_pattern="models_t5_umt5-xxl-enc-bf16.pth",
+        offload_device="cpu",
+    )
+    vae = ModelConfig(
+        model_id=model_id,
+        origin_file_pattern="Wan2.1_VAE.pth",
+        offload_device="cpu",
+    )
+
+    if "Wan2.1" in model_id:
+        return [
+            ModelConfig(
+                model_id=model_id,
+                origin_file_pattern="diffusion_pytorch_model*.safetensors",
+                offload_device="cpu",
+            ),
+            text_encoder,
+            vae,
+        ], "single_expert"
+
+    return [
+        ModelConfig(
+            model_id=model_id,
+            origin_file_pattern="high_noise_model/diffusion_pytorch_model*.safetensors",
+            offload_device="cpu",
+        ),
+        ModelConfig(
+            model_id=model_id,
+            origin_file_pattern="low_noise_model/diffusion_pytorch_model*.safetensors",
+            offload_device="cpu",
+        ),
+        text_encoder,
+        vae,
+    ], "dual_expert"
+
+
 def inference_pinn(
     prompt="water flowing down",
     negative_prompt="色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量",
@@ -239,9 +279,11 @@ def inference_pinn(
     attention_alpha=0.45,
     attention_use_motion_weighted=True,
     attention_motion_percentile=90.0,
+    observable_inspection_only=False,
     metadata_json=None,
     metadata_csv=None,
     auto_label_from_prompt=False,
+    refine_prompt_with_llm=True,
     llm_model=None,
     llm_base_url=None,
     llm_api_key=None,
@@ -261,43 +303,60 @@ def inference_pinn(
     
     # 1. 加载模型
     print("\n[1/4] Loading model...")
+    model_configs, loader_mode = build_wan_model_configs(model_id)
+    print(f"  Model loader mode: {loader_mode}")
     pipe = PhysicsInformedWanVideoPipeline.from_pretrained(
         torch_dtype=torch_dtype,
         device=device,
-        model_configs=[
-            ModelConfig(
-                model_id=model_id,
-                origin_file_pattern="high_noise_model/diffusion_pytorch_model*.safetensors",
-                offload_device="cpu"
-            ),
-            ModelConfig(
-                model_id=model_id,
-                origin_file_pattern="low_noise_model/diffusion_pytorch_model*.safetensors",
-                offload_device="cpu"
-            ),
-            ModelConfig(
-                model_id=model_id,
-                origin_file_pattern="models_t5_umt5-xxl-enc-bf16.pth",
-                offload_device="cpu"
-            ),
-            ModelConfig(
-                model_id=model_id,
-                origin_file_pattern="Wan2.1_VAE.pth",
-                offload_device="cpu"
-            ),
-        ],
+        model_configs=model_configs,
     )
     pipe.enable_vram_management()
     
     # 2. 加载 PINN plugin（如果有）
     if checkpoint_path:
         print(f"\n[2/4] Loading PINN plugin from {checkpoint_path}...")
-        pipe.load_pinn_plugin(checkpoint_path, device=device, enable_tracking=True)
-        print("PINN plugin active: every denoising step will apply PhysicsAdapter + PDE检验")
+        pipe.load_pinn_plugin(
+            checkpoint_path,
+            device=device,
+            enable_tracking=True,
+            observable_inspection_only=observable_inspection_only,
+        )
+        if observable_inspection_only:
+            print("PINN observable inspection active: Wan denoising runs normally, encoder diagnostics are recorded without applying adapter correction")
+        else:
+            print("PINN plugin active: every denoising step will apply PhysicsAdapter + PDE检验")
     else:
         print("\n[2/4] No PINN plugin provided, using original model")
     
-    # 3. 加载元数据（包含 phenomenon label 用于 MoE 路由）
+    # 3. 使用 LLM 细化 prompt（评测时对粗糙 prompt 更稳，失败则回退原 prompt）
+    original_prompt = prompt
+    effective_prompt = prompt
+    prompt_refinement = None
+    if refine_prompt_with_llm:
+        refiner = PromptVideoPromptRefiner(
+            model=llm_model,
+            base_url=llm_base_url,
+            api_key=llm_api_key,
+            api_key_env=llm_api_key_env,
+            timeout=llm_timeout,
+            max_retries=llm_max_retries,
+        )
+        prompt_refinement = refiner.refine(prompt)
+        effective_prompt = prompt_refinement.get("refined_prompt") or prompt
+        if prompt_refinement.get("used_refinement"):
+            print(
+                "\n[3/5] Refined prompt via LLM: "
+                f"original='{prompt_preview(original_prompt, limit=120)}', "
+                f"refined='{prompt_preview(effective_prompt, limit=160)}'"
+            )
+        else:
+            print("\n[3/5] Prompt refinement unavailable or unchanged, using original prompt")
+            if prompt_refinement.get("error"):
+                print(f"       LLM warning: {prompt_refinement['error']}")
+    else:
+        print("\n[3/5] Prompt refinement disabled, using original prompt")
+
+    # 4. 加载元数据（包含 phenomenon label 用于 MoE 路由）
     pinn_metadata, metadata_mode = load_inference_metadata(
         metadata_json=metadata_json,
         metadata_csv=metadata_csv,
@@ -314,31 +373,36 @@ def inference_pinn(
             max_retries=llm_max_retries,
             default_label="Fluid",
         )
-        llm_result = inferer.infer(prompt)
+        llm_result = inferer.infer(effective_prompt)
         pinn_metadata = build_minimal_label_metadata(
             llm_result["labels"],
             PHENOMENON_TO_ID,
             default_label="Fluid",
         )
         metadata_mode = "llm_auto_label"
+        routing_prompt_source = "refined_prompt" if effective_prompt != original_prompt else "original_prompt"
         print(
-            "[3/4] Auto-labeled prompt via LLM: "
-            f"prompt='{prompt_preview(prompt)}', raw_labels={llm_result['raw_labels']}, "
+            "[4/5] Auto-labeled prompt via LLM: "
+            f"{routing_prompt_source}='{prompt_preview(effective_prompt)}', raw_labels={llm_result['raw_labels']}, "
             f"final_labels={llm_result['labels']}, label_ids={pinn_metadata.get('label_ids')}, "
             f"fallback={llm_result['fallback_used']}"
         )
         if llm_result.get("error"):
             print(f"       LLM warning: {llm_result['error']}")
     if pinn_metadata is not None:
-        print(f"[3/4] Using PINN metadata for MoE routing (mode={metadata_mode}).")
+        print(f"[4/5] Using PINN metadata for MoE routing (mode={metadata_mode}).")
         phenomenon = pinn_metadata.get("label_name", "Fluid")
     else:
-        print(f"[3/4] No PINN metadata provided, using default phenomenon")
+        print(f"[4/5] No PINN metadata provided, using default phenomenon")
         phenomenon = "Fluid"
 
-    # 4. 生成视频（同时实时追踪每步的物理场 PDE 残差）
-    print(f"\n[4/4] Generating video with real-time physics tracking...")
-    print(f"  Prompt: {prompt}")
+    # 5. 生成视频（同时实时追踪每步的物理场 PDE 残差）
+    print(f"\n[5/5] Generating video with real-time physics tracking...")
+    if effective_prompt != original_prompt:
+        print(f"  Original prompt: {original_prompt}")
+        print(f"  Effective prompt: {effective_prompt}")
+    else:
+        print(f"  Prompt: {effective_prompt}")
     print(f"  Phenomenon: {phenomenon}")
     print(f"  Resolution: {height}x{width}, Frames: {num_frames}")
     print(f"  Steps: {num_inference_steps}, CFG Scale: {cfg_scale}")
@@ -346,7 +410,7 @@ def inference_pinn(
     pipe.reset_tracking()
 
     video = pipe(
-        prompt=prompt,
+        prompt=effective_prompt,
         negative_prompt=negative_prompt,
         height=height,
         width=width,
@@ -375,6 +439,12 @@ def inference_pinn(
             attention_use_motion_weighted=attention_use_motion_weighted,
             attention_motion_percentile=attention_motion_percentile,
         )
+        if observable_inspection_only:
+            pipe.save_observable_report(
+                str(Path(output_path).with_suffix("")),
+                video_frames=video,
+                fps=fps,
+            )
     
     print("=" * 80)
 
@@ -412,24 +482,29 @@ if __name__ == "__main__":
     parser.add_argument(
         "--disable_attention_overlay",
         action="store_true",
-        help="Disable attention overlay MP4/PNG generation in physics report",
+        help="Disable correction attribution overlay MP4/PNG generation in the physics report",
     )
     parser.add_argument(
         "--attention_alpha",
         type=float,
         default=0.45,
-        help="Overlay alpha for attention map visualization (0~1)",
+        help="Overlay alpha for correction attribution visualization (0~1)",
     )
     parser.add_argument(
         "--disable_motion_weighted_attention",
         action="store_true",
-        help="Use legacy raw_correction attention map instead of motion-weighted map",
+        help="Deprecated compatibility flag; reports now use raw correction attribution as the canonical cause map",
     )
     parser.add_argument(
         "--attention_motion_percentile",
         type=float,
         default=90.0,
-        help="Percentile threshold for motion prior when building weighted attention (default: 90)",
+        help="Percentile threshold for the auxiliary motion-weighted correction view (default: 90)",
+    )
+    parser.add_argument(
+        "--observable_inspection_only",
+        action="store_true",
+        help="Run full Wan inference but only record encoder observable diagnostics; do not apply adapter correction to v_original.",
     )
     parser.add_argument("--metadata_json", type=str, default=None, help="Metadata JSON string or JSON file path")
     parser.add_argument("--metadata_csv", type=str, default=None, help="CSV file path with label_id/label_name/n_numeric/n_text_ids/q_vector")
@@ -438,9 +513,14 @@ if __name__ == "__main__":
         action="store_true",
         help="Call an OpenAI-compatible LLM API to infer routing labels when metadata is absent.",
     )
-    parser.add_argument("--llm_model", type=str, default=None, help="LLM model name. Falls back to OPENAI_MODEL or LLM_MODEL.")
-    parser.add_argument("--llm_base_url", type=str, default=None, help="OpenAI-compatible base URL. Falls back to OPENAI_BASE_URL or LLM_BASE_URL.")
-    parser.add_argument("--llm_api_key", type=str, default=None, help="Optional direct API key. Prefer env vars for security.")
+    parser.add_argument(
+        "--disable_prompt_refinement",
+        action="store_true",
+        help="Skip the best-effort LLM prompt refinement step and use the original prompt directly.",
+    )
+    parser.add_argument("--llm_model", type=str, default="gpt-5.4", help="LLM model name. Falls back to OPENAI_MODEL or LLM_MODEL.")
+    parser.add_argument("--llm_base_url", type=str, default="http://14.103.68.46/v1/chat/completions", help="OpenAI-compatible base URL. Falls back to OPENAI_BASE_URL or LLM_BASE_URL.")
+    parser.add_argument("--llm_api_key", type=str, default="sk-0vyxxFvLvTYSH1GQA2YmtS3pUH4kQcOO2h6TRcT0FDy64NxB", help="Optional direct API key. Prefer env vars for security.")
     parser.add_argument("--llm_api_key_env", type=str, default="OPENAI_API_KEY", help="Environment variable name that stores the API key.")
     parser.add_argument("--llm_timeout", type=float, default=30.0, help="LLM request timeout in seconds.")
     parser.add_argument("--llm_max_retries", type=int, default=2, help="Maximum retry count for LLM requests.")
@@ -469,9 +549,11 @@ if __name__ == "__main__":
         attention_alpha=args.attention_alpha,
         attention_use_motion_weighted=not args.disable_motion_weighted_attention,
         attention_motion_percentile=args.attention_motion_percentile,
+        observable_inspection_only=args.observable_inspection_only,
         metadata_json=args.metadata_json,
         metadata_csv=args.metadata_csv,
         auto_label_from_prompt=args.auto_label_from_prompt,
+        refine_prompt_with_llm=not args.disable_prompt_refinement,
         llm_model=args.llm_model,
         llm_base_url=args.llm_base_url,
         llm_api_key=args.llm_api_key,

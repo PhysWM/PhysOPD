@@ -2,25 +2,32 @@
 Physics-Informed Flow Matching for Video Generation
 基于物理约束的视频生成 Pipeline
 """
+import os
+import shutil
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import imageio.v2 as imageio
 from typing import Any, Optional
 from tqdm import tqdm
+import numpy as np
+from PIL import Image, ImageDraw
 
 from .wan_video_new import WanVideoPipeline, model_fn_wan_video, ModelConfig
 from ..models.pinn_operators import MaterialPDEResiduals, MaterialClassifier
 from ..models.pinn_adapter import PhysicsAdapter
+from ..models.pinn_contracts import (
+    EXPERT_FIELD_RECIPE_VERSION,
+    FIELD_CONTRACT_VERSION,
+    PHENOMENON_LABELS,
+    PHYSICS_ATTR_DIM,
+)
 from ..models.model_manager import ModelManager
 from typing import Union
 
 
-PHENOMENON_LABELS = [
-    # 10 physics-based categories aligned with Table 1
-    "Rigid Body", "Elastic", "Fluid", "Compressible Flow", "Phase Change",
-    "Collision/Contact", "Granular", "Fracture", "Thermal", "Optical",
-]
 PHENOMENON_TO_ID = {name: idx for idx, name in enumerate(PHENOMENON_LABELS)}
+PHENOMENON_NAME_LOOKUP = {name.lower(): name for name in PHENOMENON_LABELS}
 
 
 class PhysicsInformedWanVideoPipeline(WanVideoPipeline):
@@ -33,7 +40,9 @@ class PhysicsInformedWanVideoPipeline(WanVideoPipeline):
         super().__init__(device=device, torch_dtype=torch_dtype, tokenizer_path=tokenizer_path)
         
         # PINN 组件
-        self.pde_residuals = MaterialPDEResiduals().to(device)
+        self.pde_residuals = MaterialPDEResiduals(strict_metadata_contract=True).to(device)
+        self.pde_residuals.eval()
+        self.pde_residuals.requires_grad_(False)
         self.material_classifier = MaterialClassifier()
         self.physics_adapter = None  # 延迟初始化，在加载模型后
         
@@ -51,6 +60,21 @@ class PhysicsInformedWanVideoPipeline(WanVideoPipeline):
         self.use_sigma_conditioning = True
         self.sigma_conditioning_dim = 64
         self.sigma_gate_floor = 0.05
+        self.adapter_hidden_dim = 64
+        self.num_phenomena = len(PHENOMENON_LABELS)
+        self.n_numeric_dim = 12
+        self.q_input_dim = 64
+        self.n_text_vocab_size = 2048
+        self.moe_top_k = 4
+        self.physics_attr_dim = PHYSICS_ATTR_DIM
+        self.expert_pde_sigma_threshold = 0.40
+        self.use_adaptive_condition_injection = True
+        self.adaptive_conditioning_dim = 64
+        self.adaptive_conditioning_strength = 0.5
+        self.adaptive_conditioning_gate_floor = 0.05
+        self.enable_rl_expert_optimization = True
+        self.rl_hidden_dim = 64
+        self.rl_reward_decay = 0.95
         
         # 推理时的物理场实时追踪记录（每次推理自动填充）
         self.physics_tracking = None
@@ -62,12 +86,12 @@ class PhysicsInformedWanVideoPipeline(WanVideoPipeline):
         if target_dim <= 0:
             return torch.zeros(batch_size, 0, device=device, dtype=dtype)
         if value is None:
-            return torch.zeros(batch_size, target_dim, device=device, dtype=dtype)
+            raise RuntimeError("Pipeline metadata contract violation: missing required conditioning tensor.")
         if isinstance(value, str):
             parts = [it.strip() for it in value.split(",") if it.strip() != ""]
             value = [float(it) for it in parts] if len(parts) > 0 else None
         if value is None:
-            return torch.zeros(batch_size, target_dim, device=device, dtype=dtype)
+            raise RuntimeError("Pipeline metadata contract violation: missing required conditioning tensor.")
         tensor = value if isinstance(value, torch.Tensor) else torch.tensor(value)
         tensor = tensor.to(device=device, dtype=dtype)
         if tensor.ndim == 1:
@@ -75,23 +99,34 @@ class PhysicsInformedWanVideoPipeline(WanVideoPipeline):
         if tensor.shape[0] == 1 and batch_size > 1:
             tensor = tensor.repeat(batch_size, 1)
         if tensor.shape[0] != batch_size:
-            tensor = tensor[:1].repeat(batch_size, 1)
+            raise RuntimeError(
+                f"Pipeline metadata contract violation: batch mismatch, expected {batch_size}, got {tensor.shape[0]}."
+            )
         feat_dim = tensor.shape[1]
         if feat_dim > target_dim:
-            return tensor[:, :target_dim]
+            raise RuntimeError(
+                f"Pipeline metadata contract violation: feature dim mismatch, expected {target_dim}, got {feat_dim}."
+            )
         if feat_dim < target_dim:
-            pad = torch.zeros(batch_size, target_dim - feat_dim, device=device, dtype=dtype)
-            return torch.cat([tensor, pad], dim=1)
+            raise RuntimeError(
+                f"Pipeline metadata contract violation: feature dim mismatch, expected {target_dim}, got {feat_dim}."
+            )
         return tensor
 
     def _prepare_adapter_metadata(self, raw_metadata: Any, batch_size: int, device, dtype):
-        if not isinstance(raw_metadata, dict):
-            return None
+        if raw_metadata is None:
+            raw_metadata = {}
+        elif not isinstance(raw_metadata, dict):
+            raise RuntimeError("Pipeline metadata contract violation: raw_metadata must be a dict.")
+
+        n_numeric_dim = int(getattr(self.physics_adapter, "n_numeric_dim", 0))
+        q_input_dim = int(getattr(self.physics_adapter, "q_input_dim", 0))
+        n_text_dim = 3
 
         # 优先使用多标签列表 label_ids，回退到单标签 label_id
         label_ids_list = raw_metadata.get("label_ids")
         label_id = raw_metadata.get("label_id")
-        label_name = str(raw_metadata.get("label_name", "")).strip().lower()
+        label_name = str(raw_metadata.get("label_name", "")).strip() or "Fluid"
 
         if label_ids_list is not None and len(label_ids_list) > 0:
             # 使用多标签列表
@@ -106,14 +141,15 @@ class PhysicsInformedWanVideoPipeline(WanVideoPipeline):
             parsed_ids = []
             for part in label_name.split(","):
                 part = part.strip()
-                if part in PHENOMENON_TO_ID:
-                    parsed_ids.append(PHENOMENON_TO_ID[part])
+                canonical_part = PHENOMENON_NAME_LOOKUP.get(part.lower())
+                if canonical_part in PHENOMENON_TO_ID:
+                    parsed_ids.append(PHENOMENON_TO_ID[canonical_part])
             if parsed_ids:
                 label_ids_tensor = torch.tensor(parsed_ids, device=device, dtype=torch.long)
             else:
-                label_ids_tensor = torch.zeros(1, device=device, dtype=torch.long)
+                raise ValueError(f"Unknown label_name for PINN metadata routing: {label_name!r}")
         else:
-            label_ids_tensor = torch.zeros(1, device=device, dtype=torch.long)
+            label_ids_tensor = torch.tensor([PHENOMENON_TO_ID["Fluid"]], device=device, dtype=torch.long)
 
         # 限制标签值范围
         max_label = max(int(getattr(self.physics_adapter, "num_phenomena", 10)) - 1, 0)
@@ -123,20 +159,24 @@ class PhysicsInformedWanVideoPipeline(WanVideoPipeline):
         label_ids_list = label_ids_tensor.tolist()
         primary_label_id = int(label_ids_list[0]) if label_ids_list else 0
 
-        n_numeric_dim = int(getattr(self.physics_adapter, "n_numeric_dim", 0))
-        q_input_dim = int(getattr(self.physics_adapter, "q_input_dim", 0))
-        n_text_dim = 3
-
         n_numeric = self._fit_metadata_2d(
-            raw_metadata.get("n_numeric"), n_numeric_dim, batch_size, device, dtype
+            raw_metadata.get("n_numeric", [0.0] * max(n_numeric_dim, 0)),
+            n_numeric_dim,
+            batch_size,
+            device,
+            dtype,
         )
         q_vector = self._fit_metadata_2d(
-            raw_metadata.get("q_vector"), q_input_dim, batch_size, device, dtype
+            raw_metadata.get("q_vector", [0.0] * max(q_input_dim, 0)),
+            q_input_dim,
+            batch_size,
+            device,
+            dtype,
         )
 
-        n_text_ids = raw_metadata.get("n_text_ids")
+        n_text_ids = raw_metadata.get("n_text_ids", [0] * max(n_text_dim, 0))
         if n_text_ids is None:
-            n_text_ids = torch.zeros(batch_size, n_text_dim, device=device, dtype=torch.long)
+            raise RuntimeError("Pipeline metadata contract violation: missing n_text_ids.")
         else:
             if isinstance(n_text_ids, str):
                 parts = [it.strip() for it in n_text_ids.split(",") if it.strip() != ""]
@@ -148,17 +188,17 @@ class PhysicsInformedWanVideoPipeline(WanVideoPipeline):
             if n_text_ids.shape[0] == 1 and batch_size > 1:
                 n_text_ids = n_text_ids.repeat(batch_size, 1)
             if n_text_ids.shape[0] != batch_size:
-                n_text_ids = n_text_ids[:1].repeat(batch_size, 1)
-            if n_text_ids.shape[1] < n_text_dim:
-                pad = torch.zeros(
-                    batch_size,
-                    n_text_dim - n_text_ids.shape[1],
-                    device=device,
-                    dtype=torch.long,
+                raise RuntimeError(
+                    f"Pipeline metadata contract violation: n_text_ids batch mismatch, expected {batch_size}, got {n_text_ids.shape[0]}."
                 )
-                n_text_ids = torch.cat([n_text_ids, pad], dim=1)
+            if n_text_ids.shape[1] < n_text_dim:
+                raise RuntimeError(
+                    f"Pipeline metadata contract violation: n_text_ids dim mismatch, expected {n_text_dim}, got {n_text_ids.shape[1]}."
+                )
             elif n_text_ids.shape[1] > n_text_dim:
-                n_text_ids = n_text_ids[:, :n_text_dim]
+                raise RuntimeError(
+                    f"Pipeline metadata contract violation: n_text_ids dim mismatch, expected {n_text_dim}, got {n_text_ids.shape[1]}."
+                )
         n_text_vocab = max(int(getattr(self.physics_adapter, "n_text_vocab_size", 2048)) - 1, 0)
         n_text_ids = torch.clamp(n_text_ids, min=0, max=n_text_vocab)
 
@@ -169,6 +209,26 @@ class PhysicsInformedWanVideoPipeline(WanVideoPipeline):
             "n_text_ids": n_text_ids,
             "q_vector": q_vector,
         }
+        motion_mask = raw_metadata.get("motion_mask")
+        if isinstance(motion_mask, torch.Tensor):
+            motion_mask = motion_mask.to(device=device, dtype=dtype)
+            if motion_mask.shape[0] == 1 and batch_size > 1:
+                repeat_shape = [batch_size] + [1] * max(motion_mask.ndim - 1, 0)
+                motion_mask = motion_mask.repeat(*repeat_shape)
+        elif motion_mask is not None:
+            motion_mask = torch.tensor(motion_mask, device=device, dtype=dtype)
+            if motion_mask.ndim == 0:
+                motion_mask = motion_mask.view(1, 1, 1, 1, 1)
+            elif motion_mask.ndim == 1:
+                motion_mask = motion_mask.view(1, 1, 1, 1, -1)
+            if motion_mask.shape[0] == 1 and batch_size > 1:
+                repeat_shape = [batch_size] + [1] * max(motion_mask.ndim - 1, 0)
+                motion_mask = motion_mask.repeat(*repeat_shape)
+        else:
+            # Keep inference aligned with the previous non-strict fallback:
+            # when no motion signal is available, treat all regions as active.
+            motion_mask = torch.ones(batch_size, 1, 1, 1, 1, device=device, dtype=dtype)
+        metadata["motion_mask"] = torch.clamp(motion_mask, 0.0, 1.0)
         if label_name != "":
             metadata["label_name"] = label_name
         return metadata
@@ -195,6 +255,63 @@ class PhysicsInformedWanVideoPipeline(WanVideoPipeline):
             sigma_expanded = self._expand_sigma_for_like(sigma, latents)
             return latents - sigma_expanded * v_pred.to(dtype=latents.dtype)
         return latents
+
+    @staticmethod
+    def _state_dict_shape(state_dict, key):
+        value = state_dict.get(key)
+        if isinstance(value, torch.Tensor):
+            return tuple(value.shape)
+        return None
+
+    def _infer_adapter_architecture_from_state_dict(self, state_dict):
+        encoder_shape = self._state_dict_shape(state_dict, "physics_encoder_shared.0.conv1.weight")
+        if encoder_shape is None or len(encoder_shape) < 2:
+            raise RuntimeError("Cannot infer PhysicsAdapter architecture from checkpoint: missing shared encoder weight.")
+
+        arch = {
+            "latent_dim": int(encoder_shape[1]),
+            "hidden_dim": int(encoder_shape[0]),
+            "num_phenomena": self.num_phenomena,
+            "n_numeric_dim": self.n_numeric_dim,
+            "q_input_dim": self.q_input_dim,
+            "n_text_vocab_size": self.n_text_vocab_size,
+            "physics_attr_dim": PHYSICS_ATTR_DIM,
+        }
+        attribute_shape = self._state_dict_shape(state_dict, "shared_attribute_head.2.weight")
+        if attribute_shape is not None and len(attribute_shape) >= 1:
+            arch["physics_attr_dim"] = int(attribute_shape[0])
+        n_text_shape = self._state_dict_shape(state_dict, "n_text_embedding.weight")
+        if n_text_shape is not None and len(n_text_shape) >= 1:
+            arch["n_text_vocab_size"] = int(n_text_shape[0])
+        q_shape = self._state_dict_shape(state_dict, "q_projector.weight")
+        if q_shape is not None and len(q_shape) >= 2:
+            arch["q_input_dim"] = int(q_shape[1])
+        n_shape = self._state_dict_shape(state_dict, "n_projector.weight")
+        if n_shape is not None and len(n_shape) >= 2:
+            arch["n_numeric_dim"] = int(n_shape[1])
+        router_shape = self._state_dict_shape(state_dict, "expert_router.2.weight")
+        if router_shape is not None and len(router_shape) >= 1:
+            arch["num_phenomena"] = int(router_shape[0])
+        return arch
+
+    @staticmethod
+    def _filter_checkpoint_key_mismatches(missing_keys, unexpected_keys, allowed_prefixes=None, allowed_missing=None):
+        if allowed_prefixes is None:
+            allowed_prefixes = set()
+        if allowed_missing is None:
+            allowed_missing = set()
+        filtered_missing = []
+        for key in missing_keys:
+            if key in allowed_missing:
+                continue
+            if any(key.startswith(prefix) for prefix in allowed_prefixes):
+                continue
+            filtered_missing.append(key)
+        filtered_unexpected = [
+            key for key in unexpected_keys
+            if not any(key.startswith(prefix) for prefix in allowed_prefixes)
+        ]
+        return filtered_missing, filtered_unexpected
     
     @staticmethod
     def from_pretrained(
@@ -408,11 +525,51 @@ class PhysicsInformedWanVideoPipeline(WanVideoPipeline):
             prompt = inputs.get("prompt", [""])[0] if isinstance(inputs.get("prompt"), list) else inputs.get("prompt", "")
             material_type = self.material_classifier.classify(prompt)
             
-            # 计算 PDE 残差
-            z_t = inputs["latents"]
-            v_pred = noise_pred  # 预测的速度场
-            
-            loss_physics, physics_info = self.compute_physics_loss(z_t, v_pred, material_type)
+            if self.physics_adapter is None:
+                raise RuntimeError(
+                    "Explicit shared-state physics loss requires a loaded PhysicsAdapter; current pipeline has none."
+                )
+            raw_metadata = inputs.get("pinn_metadata")
+            adapter_metadata = self._prepare_adapter_metadata(
+                raw_metadata,
+                batch_size=noise_pred.shape[0],
+                device=noise_pred.device,
+                dtype=noise_pred.dtype,
+            )
+            sigma = self._scheduler_sigma(
+                timestep,
+                device=noise_pred.device,
+                dtype=noise_pred.dtype,
+            )
+            physics_state_original = self._physics_state_from_prediction(
+                inputs["latents"],
+                noise_pred,
+                sigma,
+            )
+            _ = self.physics_adapter(
+                noise_pred,
+                physics_state_original,
+                sigma=sigma,
+                metadata=adapter_metadata,
+            )
+            cache = getattr(self.physics_adapter, "_cache", {})
+            x_phys = cache.get("fused_attribute_bank")
+            if x_phys is None:
+                x_phys = cache.get("fused_x_phys")
+            v_phys = cache.get("fused_attribute_bank")
+            if v_phys is None:
+                v_phys = cache.get("fused_v_phys")
+            if x_phys is None or v_phys is None:
+                raise RuntimeError(
+                    "Pipeline physics loss contract violation: adapter cache missing fused_attribute_bank."
+                )
+
+            loss_physics, physics_info = self.compute_physics_loss(
+                x_phys=x_phys,
+                v_phys=v_phys,
+                material_type=material_type,
+                metadata=adapter_metadata,
+            )
             
             # 总损失
             total_loss = loss_fm + physics_weight * loss_physics
@@ -431,39 +588,39 @@ class PhysicsInformedWanVideoPipeline(WanVideoPipeline):
             self.current_step += 1
             return loss_fm, {'loss_fm': loss_fm.item(), 'physics_weight': 0.0}
     
-    def compute_physics_loss(self, z_t, v_pred, material_type):
+    def compute_physics_loss(self, x_phys, v_phys, material_type, metadata):
         """
         计算物理损失
         
         Args:
-            z_t: latent at time t [B, C, T, H, W]
-            v_pred: predicted velocity field [B, C, T, H, W]
+            x_phys: explicit shared physical state [B, C, T, H, W]
+            v_phys: explicit shared velocity field [B, C, T, H, W]
             material_type: material type string
+            metadata: explicit adapter metadata dict
         
         Returns:
             loss_physics: scalar
             info: dict with loss components
         """
         if material_type == 'fluid':
-            return self.pde_residuals.fluid_residual(z_t, v_pred)
+            return self.pde_residuals.fluid_residual(x_phys, v_phys, metadata=metadata)
         elif material_type == 'rigid':
-            return self.pde_residuals.rigid_residual(z_t, v_pred)
+            return self.pde_residuals.rigid_residual(x_phys, v_phys, metadata=metadata)
         elif material_type == 'elastic':
-            return self.pde_residuals.elastic_residual(z_t, v_pred)
+            return self.pde_residuals.elastic_residual(x_phys, v_phys, metadata=metadata)
         elif material_type == 'particle':
-            return self.pde_residuals.particle_residual(z_t, v_pred)
+            return self.pde_residuals.particle_residual(x_phys, v_phys, metadata=metadata)
         elif material_type == 'mixed':
             # 混合材质：计算所有类型的平均
-            loss_fluid, info_fluid = self.pde_residuals.fluid_residual(z_t, v_pred)
-            loss_rigid, info_rigid = self.pde_residuals.rigid_residual(z_t, v_pred)
+            loss_fluid, info_fluid = self.pde_residuals.fluid_residual(x_phys, v_phys, metadata=metadata)
+            loss_rigid, info_rigid = self.pde_residuals.rigid_residual(x_phys, v_phys, metadata=metadata)
             loss_total = (loss_fluid + loss_rigid) * 0.5
             info = {k: v * 0.5 for k, v in {**info_fluid, **info_rigid}.items()}
             return loss_total, info
         else:
-            # 默认流体
-            return self.pde_residuals.fluid_residual(z_t, v_pred)
+            raise RuntimeError(f"Unsupported material_type for explicit physics loss: {material_type!r}")
     
-    def load_pinn_plugin(self, checkpoint_path, device=None, enable_tracking=True):
+    def load_pinn_plugin(self, checkpoint_path, device=None, enable_tracking=True, observable_inspection_only=False):
         """
         加载 PINN 插件并将 adapter 接入推理流程。
         每个去噪步骤都会实时计算 PDE 残差（散度/涡量），记录到 self.physics_tracking。
@@ -472,6 +629,7 @@ class PhysicsInformedWanVideoPipeline(WanVideoPipeline):
             checkpoint_path: PINN plugin checkpoint 路径
             device: 设备（默认用 pipeline 的 device）
             enable_tracking: 是否在推理时追踪物理场指标（默认开启）
+            observable_inspection_only: 仅使用 stage1 observable encoder 做诊断，不对 Wan 速度场施加校正
         """
         if device is None:
             device = self.device
@@ -479,11 +637,57 @@ class PhysicsInformedWanVideoPipeline(WanVideoPipeline):
         checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
         config = checkpoint.get("config", {})
         checkpoint_format_version = int(config.get("checkpoint_format_version", 0) or 0)
+        if checkpoint_format_version < 14:
+            raise RuntimeError(
+                "Checkpoint is incompatible with the hierarchical-refine-removed explicit_attribute_bank_v2 pipeline. "
+                "Use a format_version >= 14 PINN checkpoint."
+            )
+        adapter_state = checkpoint.get("physics_adapter_state_dict")
+        if not isinstance(adapter_state, dict):
+            raise RuntimeError(f"Checkpoint does not contain a valid physics_adapter_state_dict: {checkpoint_path}")
+
+        inferred_arch = self._infer_adapter_architecture_from_state_dict(adapter_state)
+        adapter_architecture = str(config.get("adapter_architecture", "") or "")
+        if adapter_architecture != FIELD_CONTRACT_VERSION:
+            raise RuntimeError(
+                "Checkpoint adapter architecture mismatch: "
+                f"expected {FIELD_CONTRACT_VERSION!r}, got {adapter_architecture!r}."
+            )
+        field_contract_version = str(config.get("field_contract_version", "") or "")
+        if field_contract_version != FIELD_CONTRACT_VERSION:
+            raise RuntimeError(
+                "Checkpoint field contract mismatch: "
+                f"expected {FIELD_CONTRACT_VERSION!r}, got {field_contract_version!r}."
+            )
+        expert_field_recipe_version = str(config.get("expert_field_recipe_version", "") or "")
+        if expert_field_recipe_version != EXPERT_FIELD_RECIPE_VERSION:
+            raise RuntimeError(
+                "Checkpoint expert field recipe mismatch: "
+                f"expected {EXPERT_FIELD_RECIPE_VERSION!r}, got {expert_field_recipe_version!r}."
+            )
         self.physics_state_mode = config.get("physics_state_mode", self.physics_state_mode)
         self.use_sigma_gate = bool(config.get("use_sigma_gate", self.use_sigma_gate))
         self.sigma_gate_curve = config.get("sigma_gate_curve", self.sigma_gate_curve)
-        default_sigma_conditioning = self.use_sigma_conditioning if checkpoint_format_version >= 4 else False
-        default_sigma_gate_floor = self.sigma_gate_floor if checkpoint_format_version >= 4 else 0.0
+        default_sigma_conditioning = self.use_sigma_conditioning
+        default_sigma_gate_floor = self.sigma_gate_floor
+        default_rl_enabled = self.enable_rl_expert_optimization
+        default_adaptive_enabled = self.use_adaptive_condition_injection
+
+        self.adapter_hidden_dim = int(config.get("adapter_hidden_dim", inferred_arch["hidden_dim"]))
+        self.num_phenomena = int(config.get("num_phenomena", inferred_arch["num_phenomena"]))
+        self.n_numeric_dim = int(config.get("n_numeric_dim", inferred_arch["n_numeric_dim"]))
+        self.q_input_dim = int(config.get("q_input_dim", inferred_arch["q_input_dim"]))
+        self.n_text_vocab_size = int(config.get("n_text_vocab_size", inferred_arch["n_text_vocab_size"]))
+        self.physics_attr_dim = int(config.get("physics_attr_dim", inferred_arch["physics_attr_dim"]))
+        if self.physics_attr_dim != PHYSICS_ATTR_DIM:
+            raise RuntimeError(
+                f"Explicit attribute-bank v2 requires physics_attr_dim={PHYSICS_ATTR_DIM}, "
+                f"got {self.physics_attr_dim}."
+            )
+        self.expert_pde_sigma_threshold = float(
+            config.get("expert_pde_sigma_threshold", self.expert_pde_sigma_threshold)
+        )
+        self.moe_top_k = int(config.get("moe_top_k", self.moe_top_k))
         self.use_sigma_conditioning = bool(
             config.get("use_sigma_conditioning", default_sigma_conditioning)
         )
@@ -491,26 +695,86 @@ class PhysicsInformedWanVideoPipeline(WanVideoPipeline):
         if sigma_conditioning_dim is not None:
             self.sigma_conditioning_dim = int(sigma_conditioning_dim)
         self.sigma_gate_floor = float(config.get("sigma_gate_floor", default_sigma_gate_floor))
+        self.use_adaptive_condition_injection = bool(
+            config.get("use_adaptive_condition_injection", default_adaptive_enabled)
+        )
+        self.adaptive_conditioning_dim = int(
+            config.get("adaptive_conditioning_dim", self.adapter_hidden_dim)
+        )
+        self.adaptive_conditioning_strength = float(
+            config.get("adaptive_conditioning_strength", self.adaptive_conditioning_strength)
+        )
+        self.adaptive_conditioning_gate_floor = float(
+            config.get("adaptive_conditioning_gate_floor", self.adaptive_conditioning_gate_floor)
+        )
+        self.enable_rl_expert_optimization = bool(
+            config.get("enable_rl_expert_optimization", default_rl_enabled)
+        )
+        self.rl_hidden_dim = int(config.get("rl_hidden_dim", self.adapter_hidden_dim))
+        self.rl_reward_decay = float(config.get("rl_reward_decay", self.rl_reward_decay))
         
         if 'physics_adapter_state_dict' in checkpoint:
-            latent_dim = 16
+            latent_dim = inferred_arch["latent_dim"]
+            self.physics_adapter = None
             self.initialize_physics_adapter(
                 latent_dim=latent_dim,
+                hidden_dim=self.adapter_hidden_dim,
+                num_phenomena=self.num_phenomena,
+                n_numeric_dim=self.n_numeric_dim,
+                q_input_dim=self.q_input_dim,
+                n_text_vocab_size=self.n_text_vocab_size,
+                physics_attr_dim=self.physics_attr_dim,
+                moe_top_k=self.moe_top_k,
                 physics_state_mode=self.physics_state_mode,
                 use_sigma_gate=self.use_sigma_gate,
                 sigma_gate_curve=self.sigma_gate_curve,
                 use_sigma_conditioning=self.use_sigma_conditioning,
                 sigma_conditioning_dim=self.sigma_conditioning_dim,
                 sigma_gate_floor=self.sigma_gate_floor,
+                use_adaptive_condition_injection=self.use_adaptive_condition_injection,
+                adaptive_conditioning_dim=self.adaptive_conditioning_dim,
+                adaptive_conditioning_strength=self.adaptive_conditioning_strength,
+                adaptive_conditioning_gate_floor=self.adaptive_conditioning_gate_floor,
+                enable_rl_expert_optimization=self.enable_rl_expert_optimization,
+                rl_hidden_dim=self.rl_hidden_dim,
+                rl_reward_decay=self.rl_reward_decay,
+                strict_physical_state_contract=True,
             )
             load_result = self.physics_adapter.load_state_dict(
                 checkpoint['physics_adapter_state_dict'],
                 strict=False,
             )
-            if len(load_result.missing_keys) > 0:
-                print(f"  PhysicsAdapter missing keys: {load_result.missing_keys[:8]}")
-            if len(load_result.unexpected_keys) > 0:
-                print(f"  PhysicsAdapter unexpected keys: {load_result.unexpected_keys[:8]}")
+            allowed_prefixes = set()
+            allowed_missing = {"expert_usage_ema"}
+            checkpoint_format_version = int(config.get("checkpoint_format_version", 0) or 0)
+            allowed_prefixes.add("obs_dynamics_head.")
+            allowed_prefixes.add("alpha_head.")
+            if not self.enable_rl_expert_optimization:
+                allowed_missing.add("rl_reward_ema")
+                allowed_prefixes.update({"rl_expert_embedding.", "rl_state_proj.", "rl_policy_head."})
+            if not self.use_adaptive_condition_injection:
+                allowed_prefixes.update({
+                    "adaptive_condition_expert_embedding.",
+                    "adaptive_condition_state_proj.",
+                    "adaptive_condition_modulator.",
+                    "shared_adaptive_condition_modulator.",
+                })
+            if checkpoint_format_version < 15:
+                allowed_prefixes.update({
+                    "u_head.",
+                    "d_head.",
+                })
+            missing_keys, unexpected_keys = self._filter_checkpoint_key_mismatches(
+                load_result.missing_keys,
+                load_result.unexpected_keys,
+                allowed_prefixes=allowed_prefixes,
+                allowed_missing=allowed_missing,
+            )
+            if missing_keys or unexpected_keys:
+                raise RuntimeError(
+                    f"Incompatible PhysicsAdapter checkpoint load. "
+                    f"missing_keys={missing_keys[:20]}, unexpected_keys={unexpected_keys[:20]}"
+                )
             if "expert_usage_ema" in set(load_result.missing_keys):
                 # Backward compatibility for old checkpoints saved without buffers.
                 with torch.no_grad():
@@ -518,18 +782,45 @@ class PhysicsInformedWanVideoPipeline(WanVideoPipeline):
                         1.0 / max(float(self.physics_adapter.num_phenomena), 1.0)
                     )
                 print("  Initialized missing buffer: expert_usage_ema")
+            if "rl_reward_ema" in set(load_result.missing_keys):
+                with torch.no_grad():
+                    self.physics_adapter.rl_reward_ema.zero_()
+                print("  Initialized missing buffer: rl_reward_ema")
             self.physics_adapter.physics_state_mode = self.physics_state_mode
             self.physics_adapter.use_sigma_gate = self.use_sigma_gate
             self.physics_adapter.sigma_gate_curve = self.sigma_gate_curve
             self.physics_adapter.use_sigma_conditioning = self.use_sigma_conditioning
             self.physics_adapter.sigma_conditioning_dim = self.sigma_conditioning_dim
             self.physics_adapter.sigma_gate_floor = self.sigma_gate_floor
+            self.physics_adapter.strict_physical_state_contract = True
             self.physics_adapter.to(dtype=self.torch_dtype, device=device)
             self.physics_adapter.eval()
             print(f"  PhysicsAdapter loaded (dtype={self.torch_dtype})")
         
         if 'pde_residuals_state_dict' in checkpoint:
-            self.pde_residuals.load_state_dict(checkpoint['pde_residuals_state_dict'])
+            self.pde_residuals = MaterialPDEResiduals(
+                num_phenomena=self.num_phenomena,
+                q_input_dim=self.q_input_dim,
+                n_numeric_dim=self.n_numeric_dim,
+                strict_metadata_contract=True,
+            ).to(device)
+            load_result = self.pde_residuals.load_state_dict(
+                checkpoint['pde_residuals_state_dict'],
+                strict=False,
+            )
+            missing_keys, unexpected_keys = self._filter_checkpoint_key_mismatches(
+                load_result.missing_keys,
+                load_result.unexpected_keys,
+                allowed_prefixes=set(),
+                allowed_missing=set(),
+            )
+            if missing_keys or unexpected_keys:
+                raise RuntimeError(
+                    f"Incompatible pde_residuals checkpoint load. "
+                    f"missing_keys={missing_keys[:20]}, unexpected_keys={unexpected_keys[:20]}"
+                )
+            self.pde_residuals.eval()
+            self.pde_residuals.requires_grad_(False)
             print(f"  PDE Residuals loaded")
         
         if 'config' in checkpoint:
@@ -577,12 +868,21 @@ class PhysicsInformedWanVideoPipeline(WanVideoPipeline):
                 v_original,
                 sigma,
             )
-            v_corrected = adapter(
-                v_original,
-                physics_state_original,
-                sigma=sigma,
-                metadata=adapter_metadata,
-            )
+            observable_outputs = None
+            if observable_inspection_only:
+                observable_stage = adapter.forward_observable_pretrain(
+                    physics_state_original,
+                    sigma=sigma,
+                )
+                observable_outputs = observable_stage.get("observable_outputs")
+                v_corrected = v_original
+            else:
+                v_corrected = adapter(
+                    v_original,
+                    physics_state_original,
+                    sigma=sigma,
+                    metadata=adapter_metadata,
+                )
             
             _step[0] += 1
             step = _step[0]
@@ -599,24 +899,18 @@ class PhysicsInformedWanVideoPipeline(WanVideoPipeline):
                 v_cf = v_corrected.float()
                 diff = v_cf - v_of
                 scale_val = adapter.scale.item()
+                effective_scale_tensor = adapter._cache.get("effective_scale")
                 effective_scale = float(
-                    adapter._cache.get("effective_scale", torch.zeros(1, device=v_original.device))
-                    .float()
-                    .mean()
-                    .item()
-                )
+                    effective_scale_tensor.detach().float().mean().item()
+                ) if isinstance(effective_scale_tensor, torch.Tensor) and effective_scale_tensor.numel() > 0 else float("nan")
+                raw_correction_norm_tensor = adapter._cache.get("raw_correction_norm")
                 raw_correction_norm = float(
-                    adapter._cache.get("raw_correction_norm", torch.zeros(1, device=v_original.device))
-                    .float()
-                    .mean()
-                    .item()
-                )
+                    raw_correction_norm_tensor.detach().float().mean().item()
+                ) if isinstance(raw_correction_norm_tensor, torch.Tensor) and raw_correction_norm_tensor.numel() > 0 else float("nan")
+                gated_correction_norm_tensor = adapter._cache.get("gated_correction_norm")
                 gated_correction_norm = float(
-                    adapter._cache.get("gated_correction_norm", torch.zeros(1, device=v_original.device))
-                    .float()
-                    .mean()
-                    .item()
-                )
+                    gated_correction_norm_tensor.detach().float().mean().item()
+                ) if isinstance(gated_correction_norm_tensor, torch.Tensor) and gated_correction_norm_tensor.numel() > 0 else float("nan")
                 corr_ratio = diff.abs().mean().item() / (v_of.abs().mean().item() + 1e-10)
                 
                 div_orig = _compute_divergence_sq(v_of)
@@ -625,6 +919,16 @@ class PhysicsInformedWanVideoPipeline(WanVideoPipeline):
                 vor_corr = _compute_vorticity_sq(v_cf)
                 smooth_orig = _compute_temporal_smoothness(v_of)
                 smooth_corr = _compute_temporal_smoothness(v_cf)
+
+                if isinstance(observable_outputs, dict):
+                    flow_tensor = observable_outputs.get("flow")
+                    deformation_tensor = observable_outputs.get("deformation")
+                    if isinstance(flow_tensor, torch.Tensor):
+                        t["final_observable_flow"] = flow_tensor.detach().to(device="cpu", dtype=torch.float32)
+                    if isinstance(deformation_tensor, torch.Tensor):
+                        t["final_observable_deformation"] = deformation_tensor.detach().to(device="cpu", dtype=torch.float32)
+                    t["final_physics_state"] = physics_state_original.detach().to(device="cpu", dtype=torch.float32)
+                    t["final_sigma"] = sigma.detach().to(device="cpu", dtype=torch.float32)
                 
                 t["steps"].append(step)
                 t["scale"].append(scale_val)
@@ -657,6 +961,8 @@ class PhysicsInformedWanVideoPipeline(WanVideoPipeline):
         self.model_fn = model_fn_with_adapter
         self._last_v_original = _last_v_original  # 暴露给外部
         print("  model_fn wrapped with PhysicsAdapter + PDE tracking")
+        if observable_inspection_only:
+            print("  Observable inspection only: adapter correction is disabled, encoder diagnostics enabled")
         print("  PINN plugin loaded successfully")
     
     def reset_tracking(self):
@@ -668,7 +974,141 @@ class PhysicsInformedWanVideoPipeline(WanVideoPipeline):
             "vor_before": [], "vor_after": [],
             "smooth_before": [], "smooth_after": [],
             "snapshots": [],
+            "final_physics_state": None,
+            "final_observable_flow": None,
+            "final_observable_deformation": None,
+            "final_sigma": None,
         }
+
+    @staticmethod
+    def _flow_to_rgb(flow, max_magnitude):
+        flow = np.asarray(flow, dtype=np.float32)
+        flow_x = flow[0]
+        flow_y = flow[1]
+        magnitude = np.sqrt(flow_x ** 2 + flow_y ** 2)
+        angle = np.arctan2(flow_y, flow_x)
+        h = (angle + np.pi) / (2 * np.pi)
+        s = np.ones_like(h, dtype=np.float32)
+        v = np.clip(magnitude / max(max_magnitude, 1e-6), 0.0, 1.0)
+
+        i = np.floor(h * 6.0).astype(np.int32)
+        f = h * 6.0 - i
+        p = v * (1.0 - s)
+        q = v * (1.0 - f * s)
+        t = v * (1.0 - (1.0 - f) * s)
+        i = i % 6
+
+        r = np.choose(i, [v, q, p, p, t, v])
+        g = np.choose(i, [t, v, v, q, p, p])
+        b = np.choose(i, [p, p, t, v, v, q])
+        rgb = np.stack([r, g, b], axis=-1)
+        return (rgb * 255.0).clip(0, 255).astype(np.uint8)
+
+    @staticmethod
+    def _resize_rgb(rgb, size):
+        image = Image.fromarray(rgb)
+        return image.resize(size, Image.BILINEAR)
+
+    @staticmethod
+    def _add_label(image, text):
+        image = image.copy()
+        draw = ImageDraw.Draw(image)
+        draw.rectangle((0, 0, image.width, 18), fill=(0, 0, 0))
+        draw.text((4, 2), text, fill=(255, 255, 255))
+        return image
+
+    def save_observable_report(self, output_prefix: str, video_frames=None, fps: int = 15):
+        tracking = self.physics_tracking
+        if tracking is None:
+            print("  No physics tracking data to export observable report.")
+            return
+        physics_state = tracking.get("final_physics_state")
+        observable_flow = tracking.get("final_observable_flow")
+        if not isinstance(physics_state, torch.Tensor) or not isinstance(observable_flow, torch.Tensor):
+            print("  Observable report skipped: final x0_hat / observable_flow not found.")
+            return
+
+        self.load_models_to_device(["vae"])
+        physics_state = physics_state.to(device=self.device, dtype=self.torch_dtype)
+        decoded_x0hat = self.vae.decode(
+            physics_state,
+            device=self.device,
+            tiled=True,
+            tile_size=(30, 52),
+            tile_stride=(15, 26),
+        )
+        decoded_x0hat = decoded_x0hat.detach().cpu().float()
+        self.load_models_to_device([])
+
+        x0hat_frames = self.vae_output_to_video(decoded_x0hat)
+        flow_np = observable_flow[0].detach().cpu().float().numpy()
+        time_steps = flow_np.shape[1]
+        max_magnitude = np.percentile(
+            np.sqrt((flow_np ** 2).sum(axis=0)).reshape(-1),
+            95,
+        )
+
+        base = output_prefix
+        sheet_path = f"{base}_observable_sheet.png"
+        video_path = f"{base}_observable.mp4"
+
+        columns = np.linspace(0, max(time_steps - 1, 0), 6, dtype=int) if time_steps > 0 else np.array([0] * 6)
+        tile_size = (192, 108)
+        left_margin = 132
+        top_margin = 36
+        row_gap = 12
+        col_gap = 8
+        row_labels = ["Generated", "x0_hat", "Pred Flow"]
+        canvas_w = left_margin + len(columns) * tile_size[0] + (len(columns) - 1) * col_gap
+        canvas_h = top_margin + len(row_labels) * tile_size[1] + (len(row_labels) - 1) * row_gap
+        canvas = Image.new("RGB", (canvas_w, canvas_h), color=(20, 22, 24))
+        draw = ImageDraw.Draw(canvas)
+        draw.text((16, 12), "Wan Inference Observable Report", fill=(255, 255, 255))
+        raw_frames_count = len(video_frames) if video_frames is not None else 0
+        x0hat_frames_count = len(x0hat_frames)
+        for col, t_idx in enumerate(columns):
+            gen_t = int(round(t_idx / max(time_steps - 1, 1) * max(raw_frames_count - 1, 0))) if raw_frames_count > 0 else 0
+            x0hat_t = int(round(t_idx / max(time_steps - 1, 1) * max(x0hat_frames_count - 1, 0)))
+            tiles = []
+            if raw_frames_count > 0:
+                tiles.append(np.asarray(video_frames[gen_t].convert("RGB")))
+            else:
+                tiles.append(np.zeros((decoded_x0hat.shape[3], decoded_x0hat.shape[4], 3), dtype=np.uint8))
+            tiles.append(np.asarray(x0hat_frames[x0hat_t].convert("RGB")))
+            tiles.append(self._flow_to_rgb(flow_np[:, t_idx], max_magnitude))
+            x = left_margin + col * (tile_size[0] + col_gap)
+            draw.text((x, 12), f"t={t_idx:02d}", fill=(255, 255, 255))
+            for row, tile in enumerate(tiles):
+                y = top_margin + row * (tile_size[1] + row_gap)
+                panel = self._add_label(self._resize_rgb(tile, tile_size), "")
+                canvas.paste(panel, (x, y))
+        for row, label in enumerate(row_labels):
+            y = top_margin + row * (tile_size[1] + row_gap) + tile_size[1] // 2 - 8
+            draw.text((16, y), label, fill=(255, 255, 255))
+        canvas.save(sheet_path)
+
+        frames = []
+        for t_idx in range(time_steps):
+            gen_t = int(round(t_idx / max(time_steps - 1, 1) * max(raw_frames_count - 1, 0))) if raw_frames_count > 0 else 0
+            x0hat_t = int(round(t_idx / max(time_steps - 1, 1) * max(x0hat_frames_count - 1, 0)))
+            panels = []
+            if raw_frames_count > 0:
+                panels.append(self._add_label(self._resize_rgb(np.asarray(video_frames[gen_t].convert("RGB")), (224, 126)), "Generated"))
+            else:
+                panels.append(self._add_label(Image.fromarray(np.zeros((126, 224, 3), dtype=np.uint8)), "Generated"))
+            panels.append(self._add_label(self._resize_rgb(np.asarray(x0hat_frames[x0hat_t].convert("RGB")), (224, 126)), "x0_hat"))
+            panels.append(self._add_label(self._resize_rgb(self._flow_to_rgb(flow_np[:, t_idx], max_magnitude), (224, 126)), "Pred Flow"))
+            frame_canvas = Image.new("RGB", (len(panels) * 224, 126 + 24), color=(14, 14, 16))
+            frame_draw = ImageDraw.Draw(frame_canvas)
+            frame_draw.text((8, 4), f"observable t={t_idx:02d}", fill=(255, 255, 255))
+            for i, panel in enumerate(panels):
+                frame_canvas.paste(panel, (i * 224, 24))
+            frames.append(np.asarray(frame_canvas))
+        with imageio.get_writer(video_path, fps=fps, codec="libx264", quality=8, macro_block_size=None) as writer:
+            for frame in frames:
+                writer.append_data(frame)
+        print(f"  [Report] Observable sheet -> {sheet_path}")
+        print(f"  [Report] Observable video -> {video_path}")
     
     def save_physics_report(
         self,
@@ -700,41 +1140,95 @@ class PhysicsInformedWanVideoPipeline(WanVideoPipeline):
         base = output_path.replace(".png", "")
         output_dir = os.path.dirname(output_path) or "."
         os.makedirs(output_dir, exist_ok=True)
+        correction_maps_path = f"{base}_correction_attribution_maps.png"
+        correction_maps_alias = f"{base}_attention_maps.png"
+        correction_overlay_path = f"{base}_correction_attribution_overlay.png"
+        correction_overlay_alias = f"{base}_attention_overlay.png"
+        correction_overlay_video_path = f"{base}_correction_attribution_overlay.mp4"
+        correction_overlay_video_alias = f"{base}_attention_overlay.mp4"
+        trace_path = f"{base}_physics_trace.npz"
         
         # ═══════════ 图1: 标量曲线（latent 空间指标） ═══════════
         self._plot_scalar_curves(t, f"{base}_curves.png")
         
         snapshots = t.get("snapshots", [])
         
-        # ═══════════ 图2: 关注区域（raw_correction） ═══════════
+        # ═══════════ 图2: correction attribution（raw_correction） ═══════════
         if snapshots:
             self._plot_attention_maps_from_snapshots(
-                snapshots, f"{base}_attention_maps.png"
+                snapshots, correction_maps_path
             )
+            self._write_report_alias(correction_maps_path, correction_maps_alias)
             if video_frames:
-                attention_maps = self._build_attention_maps_for_video(
+                correction_attribution_maps = self._build_attention_maps_for_video(
                     snapshots=snapshots,
                     n_frames=len(video_frames),
                     frame_height=video_frames[0].height,
                     frame_width=video_frames[0].width,
-                    use_motion_weighted=attention_use_motion_weighted,
+                    use_motion_weighted=False,
                     motion_percentile=attention_motion_percentile,
                 )
-                if attention_maps is not None:
+                motion_weighted_maps = self._build_attention_maps_for_video(
+                    snapshots=snapshots,
+                    n_frames=len(video_frames),
+                    frame_height=video_frames[0].height,
+                    frame_width=video_frames[0].width,
+                    use_motion_weighted=True,
+                    motion_percentile=attention_motion_percentile,
+                )
+                overlay_maps = correction_attribution_maps
+                if overlay_maps is None and attention_use_motion_weighted:
+                    overlay_maps = motion_weighted_maps
+                if overlay_maps is not None:
                     self._plot_attention_overlay_on_frames(
                         video_frames=video_frames,
-                        attention_maps=attention_maps,
-                        path=f"{base}_attention_overlay.png",
+                        attention_maps=overlay_maps,
+                        path=correction_overlay_path,
                         alpha=attention_alpha,
                     )
+                    self._write_report_alias(correction_overlay_path, correction_overlay_alias)
                     if attention_overlay:
                         self._export_attention_overlay_video(
                             video_frames=video_frames,
-                            attention_maps=attention_maps,
-                            path=f"{base}_attention_overlay.mp4",
+                            attention_maps=overlay_maps,
+                            path=correction_overlay_video_path,
                             alpha=attention_alpha,
                             fps=attention_video_fps,
                         )
+                        self._write_report_alias(
+                            correction_overlay_video_path,
+                            correction_overlay_video_alias,
+                        )
+                if correction_attribution_maps is not None or motion_weighted_maps is not None:
+                    trace_cause = correction_attribution_maps
+                    if trace_cause is None:
+                        trace_cause = np.zeros_like(motion_weighted_maps, dtype=np.float32)
+                    trace_motion = motion_weighted_maps
+                    if trace_motion is None:
+                        trace_motion = np.zeros_like(trace_cause, dtype=np.float32)
+                    np.savez_compressed(
+                        trace_path,
+                        correction_attribution_video=np.asarray(trace_cause, dtype=np.float32),
+                        motion_weighted_correction_video=np.asarray(trace_motion, dtype=np.float32),
+                        raw_correction_norm_per_step=np.asarray(
+                            t.get("raw_correction_norm", []),
+                            dtype=np.float32,
+                        ),
+                        correction_ratio_per_step=np.asarray(
+                            t.get("correction_ratio", []),
+                            dtype=np.float32,
+                        ),
+                        divergence_before_per_step=np.asarray(
+                            t.get("div_before", []),
+                            dtype=np.float32,
+                        ),
+                        divergence_after_per_step=np.asarray(
+                            t.get("div_after", []),
+                            dtype=np.float32,
+                        ),
+                        step_indices=np.asarray(t.get("steps", []), dtype=np.int32),
+                    )
+                    print(f"  [Report] Physics trace NPZ -> {trace_path}")
 
         # ═══════════ 图3: 通道分析 ═══════════
         if snapshots:
@@ -754,18 +1248,29 @@ class PhysicsInformedWanVideoPipeline(WanVideoPipeline):
         print(f"  │  Divergence  before PINN  = {div_b:.6f}                      │")
         print(f"  │  Divergence  after  PINN  = {div_a:.6f}                      │")
         print(f"  │  Divergence  reduction    = {div_r:+.2f}%                     │")
-        print(f"  │  adapter.scale  avg       = {scale_avg:.6f}                  │")
-        print(f"  │  effective scale avg      = {effective_scale_avg:.6f}                  │")
+        print(f"  │  adapter.scale  avg*      = {scale_avg:.6f}                  │")
+        print(f"  │  effective scale avg*     = {effective_scale_avg:.6f}                  │")
         print(f"  │  raw correction norm avg  = {raw_corr_avg:.6f}                  │")
         print(f"  │  gated corr norm avg      = {gated_corr_avg:.6f}                  │")
         print(f"  │  correction ratio avg     = {ratio_avg:.4f}%                 │")
         if div_r > 1:
             print(f"  │  ✓ PINN 有效降低了物理违约                                  │")
         elif div_r > -1:
-            print(f"  │  ~ PINN 对物理场影响不大 (scale可能太小)                     │")
+            print(f"  │  ~ PINN 对物理场影响不大 (检查 correction/router/PDE)       │")
         else:
             print(f"  │  ✗ PINN 可能在恶化物理一致性 (需检查训练)                    │")
         print(f"  └─────────────────────────────────────────────────────────────┘")
+        print("    * shared-slots v1 中 scale 仅为兼容统计项，不再承担最终输出门控。")
+
+    @staticmethod
+    def _write_report_alias(source_path: str, alias_path: str):
+        if source_path == alias_path:
+            return
+        if not source_path or not alias_path:
+            return
+        if not os.path.exists(source_path):
+            return
+        shutil.copyfile(source_path, alias_path)
     
     # ────────── 子图绘制方法 ──────────
     
@@ -801,7 +1306,7 @@ class PhysicsInformedWanVideoPipeline(WanVideoPipeline):
         ax = axes[1, 0]
         ax.plot(steps, t["scale"], "g-o", ms=3, lw=1.5)
         ax.axhline(0, color="gray", ls="--", alpha=0.4)
-        ax.set_title("adapter.scale (learned correction strength)")
+        ax.set_title("adapter.scale (compat stat; no output gating)")
         ax.set_xlabel("Step"); ax.grid(True, alpha=0.3)
         
         ax = axes[1, 1]
@@ -832,7 +1337,7 @@ class PhysicsInformedWanVideoPipeline(WanVideoPipeline):
         use_motion_weighted: bool = True,
         motion_percentile: float = 90.0,
     ):
-        """将 snapshot 中的 correction attention 映射到视频帧尺寸。"""
+        """将 correction attribution 从 latent snapshot 投影到视频帧尺寸。"""
         import numpy as np
         
         if not snapshots or n_frames <= 0 or frame_height <= 0 or frame_width <= 0:
@@ -843,8 +1348,10 @@ class PhysicsInformedWanVideoPipeline(WanVideoPipeline):
         for snap in snapshots:
             # 优先使用 motion-weighted correction，保证与动态区域约束一致。
             m = None
+            used_preweighted_map = False
             if use_motion_weighted:
                 m = snap.get("motion_weighted_correction_map")
+                used_preweighted_map = m is not None
             if m is None:
                 m = snap.get("raw_correction_map")
             if m is None:
@@ -854,7 +1361,7 @@ class PhysicsInformedWanVideoPipeline(WanVideoPipeline):
             m = np.asarray(m, dtype=np.float32)  # [T, H, W]
             if m.ndim != 3:
                 continue
-            if use_motion_weighted:
+            if use_motion_weighted and not used_preweighted_map:
                 motion_map = snap.get("motion_mask_map")
                 if motion_map is not None:
                     motion_map = np.asarray(motion_map, dtype=np.float32)
@@ -869,7 +1376,7 @@ class PhysicsInformedWanVideoPipeline(WanVideoPipeline):
             raw_steps.append(float(snap.get("step", len(raw_steps) + 1)))
         
         if not raw_maps:
-            print("  [Report] No correction_map found in snapshots (skip attention).")
+            print("  [Report] No correction map found in snapshots (skip correction attribution).")
             return None
         
         # 越靠后的 denoising step 与最终可见结果对应性越强，因此提高后期 snapshot 权重。
@@ -900,7 +1407,7 @@ class PhysicsInformedWanVideoPipeline(WanVideoPipeline):
     
     @staticmethod
     def _smooth_attention_volume(volume, spatial_kernel: int = 5, temporal_kernel: int = 3):
-        """对 latent attention 做轻量时空平滑，抑制高频颗粒噪声。"""
+        """对 latent correction attribution 做轻量时空平滑，抑制高频颗粒噪声。"""
         tensor = torch.from_numpy(volume).unsqueeze(0).unsqueeze(0)
         k_t = max(1, int(temporal_kernel))
         k_s = max(1, int(spatial_kernel))
@@ -931,7 +1438,7 @@ class PhysicsInformedWanVideoPipeline(WanVideoPipeline):
     
     @staticmethod
     def _compose_attention_overlay(frame, attention_map, alpha: float = 0.45, cmap_name: str = "inferno"):
-        """按像素 alpha 叠加 attention，避免整帧统一染色。"""
+        """按像素 alpha 叠加 correction attribution，避免整帧统一染色。"""
         import matplotlib.cm as cm
         import numpy as np
         
@@ -945,7 +1452,7 @@ class PhysicsInformedWanVideoPipeline(WanVideoPipeline):
     
     @staticmethod
     def _plot_attention_maps_from_snapshots(snapshots: list, path: str):
-        """展示多个 snapshot 在 latent 空间的关注区域热图（中间时间帧）。"""
+        """展示多个 snapshot 在 latent 空间的 correction attribution 热图。"""
         import matplotlib.pyplot as plt
         import numpy as np
         
@@ -959,7 +1466,7 @@ class PhysicsInformedWanVideoPipeline(WanVideoPipeline):
             valid.append((snap.get("step", -1), np.asarray(m, dtype=np.float32)))
         
         if not valid:
-            print("  [Report] No snapshot attention maps (skip attention_maps.png).")
+            print("  [Report] No snapshot correction attribution maps (skip correction_attribution_maps.png).")
             return
         
         n_rows = min(6, len(valid))
@@ -969,7 +1476,7 @@ class PhysicsInformedWanVideoPipeline(WanVideoPipeline):
         if n_rows == 1:
             axes = axes[np.newaxis, :]
         fig.suptitle(
-            "PINN Attention in Latent Space (raw_correction mid-time slice)",
+            "PINN Correction Attribution in Latent Space (raw_correction mid-time slice)",
             fontsize=13,
             fontweight="bold",
         )
@@ -989,24 +1496,24 @@ class PhysicsInformedWanVideoPipeline(WanVideoPipeline):
             axes[row, 0].set_ylabel(f"Step {step}", fontsize=10, fontweight="bold")
             
             axes[row, 1].imshow(norm, cmap="hot", interpolation="bilinear", aspect="auto")
-            axes[row, 1].set_title("Normalized attention (p99)", fontsize=10)
+            axes[row, 1].set_title("Normalized correction attribution (p99)", fontsize=10)
             axes[row, 1].set_xticks([]); axes[row, 1].set_yticks([])
         
         plt.tight_layout()
         plt.savefig(path, dpi=150, bbox_inches="tight")
         plt.close()
-        print(f"  [Report] Attention maps → {path}")
+        print(f"  [Report] Correction attribution maps -> {path}")
     
     @staticmethod
     def _plot_attention_overlay_on_frames(video_frames: list, attention_maps, path: str, alpha: float = 0.45):
-        """将 attention 热图叠加到若干抽样视频帧。"""
+        """将 correction attribution 热图叠加到若干抽样视频帧。"""
         import matplotlib.pyplot as plt
         import matplotlib.cm as cm
         import numpy as np
         
         n_total = min(len(video_frames), attention_maps.shape[0])
         if n_total <= 0:
-            print("  [Report] Empty frames/maps (skip attention overlay PNG).")
+            print("  [Report] Empty frames/maps (skip correction attribution overlay PNG).")
             return
         
         n_rows = min(6, n_total)
@@ -1016,7 +1523,7 @@ class PhysicsInformedWanVideoPipeline(WanVideoPipeline):
         if n_rows == 1:
             axes = axes[np.newaxis, :]
         fig.suptitle(
-            "PINN Attention Overlay in Pixel Space",
+            "PINN Correction Attribution Overlay in Pixel Space",
             fontsize=14,
             fontweight="bold",
         )
@@ -1040,21 +1547,21 @@ class PhysicsInformedWanVideoPipeline(WanVideoPipeline):
             axes[row, 0].set_ylabel(f"Frame {idx}", fontsize=10, fontweight="bold")
             
             axes[row, 1].imshow(att, cmap="inferno", vmin=0.0, vmax=1.0)
-            axes[row, 1].set_title("Attention map", fontsize=10)
+            axes[row, 1].set_title("Correction attribution map", fontsize=10)
             axes[row, 1].set_xticks([]); axes[row, 1].set_yticks([])
             
             axes[row, 2].imshow(blend)
-            axes[row, 2].set_title("Overlay (bright=high attention)", fontsize=10)
+            axes[row, 2].set_title("Overlay (bright=high correction)", fontsize=10)
             axes[row, 2].set_xticks([]); axes[row, 2].set_yticks([])
         
         plt.tight_layout()
         plt.savefig(path, dpi=150, bbox_inches="tight")
         plt.close()
-        print(f"  [Report] Attention overlay PNG → {path}")
+        print(f"  [Report] Correction attribution overlay PNG -> {path}")
     
     @staticmethod
     def _export_attention_overlay_video(video_frames: list, attention_maps, path: str, alpha: float = 0.45, fps: int = 15):
-        """导出逐帧 attention overlay MP4。"""
+        """导出逐帧 correction attribution overlay MP4。"""
         import matplotlib.cm as cm
         import numpy as np
         from PIL import Image
@@ -1062,7 +1569,7 @@ class PhysicsInformedWanVideoPipeline(WanVideoPipeline):
         
         n_total = min(len(video_frames), attention_maps.shape[0])
         if n_total <= 0:
-            print("  [Report] Empty frames/maps (skip attention overlay MP4).")
+            print("  [Report] Empty frames/maps (skip correction attribution overlay MP4).")
             return
         
         alpha = float(max(0.0, min(1.0, alpha)))
@@ -1080,7 +1587,7 @@ class PhysicsInformedWanVideoPipeline(WanVideoPipeline):
             out_frames.append(Image.fromarray(blend))
         
         save_video(out_frames, path, fps=int(max(1, fps)), quality=5)
-        print(f"  [Report] Attention overlay MP4 → {path}")
+        print(f"  [Report] Correction attribution overlay MP4 -> {path}")
     
     @staticmethod
     def _plot_spatial_maps(snapshots: list, path: str):
@@ -1284,18 +1791,39 @@ class PhysicsInformedWanVideoPipeline(WanVideoPipeline):
     def initialize_physics_adapter(
         self,
         latent_dim=16,
+        hidden_dim=64,
+        num_phenomena=10,
+        n_numeric_dim=12,
+        q_input_dim=64,
+        n_text_vocab_size=2048,
+        physics_attr_dim=PHYSICS_ATTR_DIM,
+        moe_top_k=4,
         physics_state_mode=None,
         use_sigma_gate=None,
         sigma_gate_curve=None,
         use_sigma_conditioning=None,
         sigma_conditioning_dim=None,
         sigma_gate_floor=None,
+        use_adaptive_condition_injection=True,
+        adaptive_conditioning_dim=None,
+        adaptive_conditioning_strength=0.5,
+        adaptive_conditioning_gate_floor=0.05,
+        enable_rl_expert_optimization=True,
+        rl_hidden_dim=None,
+        rl_reward_decay=0.95,
+        strict_physical_state_contract=True,
     ):
         """初始化物理适配器（在模型加载后调用）"""
         if self.physics_adapter is None:
             self.physics_adapter = PhysicsAdapter(
                 latent_dim=latent_dim,
-                hidden_dim=64,
+                hidden_dim=hidden_dim,
+                num_phenomena=num_phenomena,
+                n_numeric_dim=n_numeric_dim,
+                q_input_dim=q_input_dim,
+                n_text_vocab_size=n_text_vocab_size,
+                physics_attr_dim=physics_attr_dim,
+                moe_top_k=moe_top_k,
                 physics_state_mode=physics_state_mode or self.physics_state_mode,
                 use_sigma_gate=self.use_sigma_gate if use_sigma_gate is None else use_sigma_gate,
                 sigma_gate_curve=sigma_gate_curve or self.sigma_gate_curve,
@@ -1308,6 +1836,14 @@ class PhysicsInformedWanVideoPipeline(WanVideoPipeline):
                 sigma_gate_floor=(
                     self.sigma_gate_floor if sigma_gate_floor is None else sigma_gate_floor
                 ),
+                use_adaptive_condition_injection=use_adaptive_condition_injection,
+                adaptive_conditioning_dim=adaptive_conditioning_dim,
+                adaptive_conditioning_strength=adaptive_conditioning_strength,
+                adaptive_conditioning_gate_floor=adaptive_conditioning_gate_floor,
+                enable_rl_expert_optimization=enable_rl_expert_optimization,
+                rl_hidden_dim=rl_hidden_dim,
+                rl_reward_decay=rl_reward_decay,
+                strict_physical_state_contract=strict_physical_state_contract,
             ).to(self.device)
             print(f"✓ Physics Adapter initialized (latent_dim={latent_dim})")
         return self.physics_adapter
