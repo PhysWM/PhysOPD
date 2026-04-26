@@ -14,8 +14,9 @@ import os
 import json
 import re
 import hashlib
+import time
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable
 
 # 添加项目路径
 project_root = Path(__file__).parent.parent.parent.parent
@@ -43,12 +44,188 @@ PHENOMENON_NAME_LOOKUP = {name.lower(): name for name in PHENOMENON_LABELS}
 PHENOMENON_ALIAS = {}
 DEFAULT_LLM_MODEL = "gpt-5.4"
 DEFAULT_LLM_BASE_URL = "http://14.103.68.46/v1/chat/completions"
+DEFAULT_ROUTER_SAMPLE_IDS = [
+    1, 2, 3, 4, 5,
+    26, 27, 28, 29, 30,
+    41, 42, 43, 44, 45,
+    46, 47, 48, 49, 50,
+    56, 57, 58, 59, 60,
+    131, 132, 133, 134, 135,
+]
+
+
+def parse_excluded_expert_names(text):
+    if text is None:
+        return []
+    if isinstance(text, str):
+        parts = [
+            part.strip()
+            for part in text.replace(";", ",").split(",")
+            if part.strip()
+        ]
+    else:
+        parts = [str(part).strip() for part in text if str(part).strip()]
+    lookup = {label.casefold(): label for label in PHENOMENON_LABELS}
+    unknown = [part for part in parts if part.casefold() not in lookup]
+    if unknown:
+        raise ValueError(f"Unknown excluded expert names: {unknown}. Known experts: {PHENOMENON_LABELS}")
+    normalized = []
+    seen = set()
+    for part in parts:
+        canonical = lookup[part.casefold()]
+        if canonical not in seen:
+            normalized.append(canonical)
+            seen.add(canonical)
+    return normalized
+
+
+def allowed_phenomenon_labels(excluded_expert_names):
+    excluded = set(parse_excluded_expert_names(excluded_expert_names))
+    return [label for label in PHENOMENON_LABELS if label not in excluded]
+
+
+def _label_ids_from_value(value):
+    if value is None:
+        return []
+    if isinstance(value, torch.Tensor):
+        value = value.detach().cpu().reshape(-1).tolist()
+    elif isinstance(value, str):
+        value = _parse_vector(value, cast_type=int) or []
+    elif not isinstance(value, (list, tuple)):
+        value = [value]
+    ids = []
+    for item in value:
+        try:
+            ids.append(int(item))
+        except (TypeError, ValueError):
+            continue
+    return ids
+
+
+def _label_ids_from_names(text):
+    ids = []
+    for part in str(text or "").split(","):
+        canonical = PHENOMENON_NAME_LOOKUP.get(part.strip().lower())
+        if canonical in PHENOMENON_TO_ID:
+            ids.append(PHENOMENON_TO_ID[canonical])
+    return ids
+
+
+def sanitize_metadata_labels(metadata, excluded_expert_names, default_label="Fluid"):
+    if not isinstance(metadata, dict):
+        return metadata
+    excluded_names = parse_excluded_expert_names(excluded_expert_names)
+    if not excluded_names:
+        return metadata
+    excluded_ids = {PHENOMENON_TO_ID[name] for name in excluded_names}
+    allowed_ids = [idx for idx in range(len(PHENOMENON_LABELS)) if idx not in excluded_ids]
+    if not allowed_ids:
+        raise ValueError("All physics experts were excluded; at least one expert must remain available.")
+    fallback_id = PHENOMENON_TO_ID.get(default_label, allowed_ids[0])
+    if fallback_id not in allowed_ids:
+        fallback_id = allowed_ids[0]
+
+    candidate_ids = _label_ids_from_value(metadata.get("label_ids"))
+    if not candidate_ids:
+        candidate_ids = _label_ids_from_value(metadata.get("label_id"))
+    if not candidate_ids:
+        candidate_ids = _label_ids_from_names(metadata.get("label_name", metadata.get("label", "")))
+
+    filtered = []
+    seen = set()
+    for label_id in candidate_ids:
+        if label_id < 0 or label_id >= len(PHENOMENON_LABELS):
+            continue
+        if label_id in excluded_ids or label_id in seen:
+            continue
+        filtered.append(label_id)
+        seen.add(label_id)
+    if not filtered:
+        filtered = [fallback_id]
+
+    sanitized = dict(metadata)
+    sanitized["label_ids"] = filtered
+    sanitized["label_id"] = int(filtered[0])
+    sanitized["label_name"] = ", ".join(PHENOMENON_LABELS[idx] for idx in filtered)
+    return sanitized
+
+
+def cuda_synchronize_if_needed(device):
+    if torch.cuda.is_available() and str(device).startswith("cuda"):
+        torch.cuda.synchronize()
+
+
+def reset_cuda_peak_memory_if_needed(device):
+    if torch.cuda.is_available() and str(device).startswith("cuda"):
+        torch.cuda.reset_peak_memory_stats()
+
+
+def cuda_memory_gb(device):
+    if not (torch.cuda.is_available() and str(device).startswith("cuda")):
+        return None, None
+    return (
+        float(torch.cuda.max_memory_allocated()) / 1e9,
+        float(torch.cuda.max_memory_reserved()) / 1e9,
+    )
+
+
+def append_performance_record(path, record: dict[str, Any]):
+    if path is None:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def performance_record_exists(path, sample_id: int) -> bool:
+    if path is None or not path.exists():
+        return False
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if int(record.get("sample_id", -1)) == int(sample_id):
+                    return True
+    except OSError:
+        return False
+    return False
 
 
 def _safe_text(value):
     if value is None:
         return ""
     return str(value).strip()
+
+
+def _default_inference_llm_api_key():
+    """Use the same direct default key as inference_pinn.py without duplicating it."""
+    inference_path = Path(__file__).with_name("inference_pinn.py")
+    try:
+        text = inference_path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    marker = 'parser.add_argument("--llm_api_key"'
+    start = text.find(marker)
+    if start < 0:
+        return None
+    end = text.find(")", start)
+    snippet = text[start:end if end > start else start + 500]
+    default_marker = 'default="'
+    default_start = snippet.find(default_marker)
+    if default_start < 0:
+        return None
+    default_start += len(default_marker)
+    default_end = snippet.find('"', default_start)
+    if default_end < 0:
+        return None
+    value = snippet[default_start:default_end].strip()
+    return value or None
 
 
 def _parse_vector(text, cast_type=float):
@@ -299,6 +476,159 @@ def scan_existing_ids(output_dir: Path) -> set[int]:
     return existing_ids
 
 
+def parse_sample_ids(text):
+    text = _safe_text(text)
+    if not text:
+        return None
+    if text == "router30":
+        return list(DEFAULT_ROUTER_SAMPLE_IDS)
+    items = text.replace(",", " ").split()
+    return [int(item) for item in items]
+
+
+def _tensor_to_python(value: Any) -> Any:
+    if isinstance(value, torch.Tensor):
+        value = value.detach().cpu()
+        if value.numel() == 1:
+            if value.dtype in (torch.int8, torch.int16, torch.int32, torch.int64, torch.uint8):
+                return int(value.item())
+            return float(value.float().item())
+        if value.dtype in (torch.int8, torch.int16, torch.int32, torch.int64, torch.uint8):
+            return value.tolist()
+        return value.float().tolist()
+    if isinstance(value, (list, tuple)):
+        return [_tensor_to_python(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): _tensor_to_python(item) for key, item in value.items()}
+    return value
+
+
+def _dense_expert_weights(cache: dict[str, Any], num_experts: int) -> list[list[float]]:
+    indices = cache.get("active_expert_indices")
+    weights = cache.get("active_expert_weights")
+    if not isinstance(indices, torch.Tensor) or not isinstance(weights, torch.Tensor):
+        return []
+    indices = indices.detach().long().cpu()
+    weights = weights.detach().float().cpu()
+    if indices.ndim == 1:
+        indices = indices.unsqueeze(0)
+    if weights.ndim == 1:
+        weights = weights.unsqueeze(0)
+    dense = torch.zeros((indices.shape[0], num_experts), dtype=torch.float32)
+    valid = (indices >= 0) & (indices < num_experts)
+    safe_indices = indices.clamp(0, max(num_experts - 1, 0))
+    dense.scatter_add_(1, safe_indices, weights * valid.float())
+    return dense.tolist()
+
+
+def _dense_cache_vectors(cache: dict[str, Any], key: str, num_experts: int) -> list[list[float]]:
+    value = cache.get(key)
+    if not isinstance(value, torch.Tensor):
+        return []
+    value = value.detach().float().cpu()
+    if value.ndim == 1:
+        value = value.unsqueeze(0)
+    if value.ndim != 2 or value.shape[-1] != num_experts:
+        return []
+    return value.tolist()
+
+
+class RouterTraceHook:
+    """Capture real PhysicsAdapter router cache without changing the pipeline."""
+
+    def __init__(self, adapter):
+        self.adapter = adapter
+        self.original_forward = adapter.forward
+        self.records: list[dict[str, Any]] = []
+        self.sample_context: dict[str, Any] = {}
+        self.step = 0
+        self.num_experts = int(getattr(adapter, "num_phenomena", len(PHENOMENON_LABELS)))
+        self.installed = False
+
+    def install(self):
+        if self.installed:
+            return
+
+        def traced_forward(*args, **kwargs):
+            result = self.original_forward(*args, **kwargs)
+            self.step += 1
+            cache = getattr(self.adapter, "_cache", {})
+            if isinstance(cache, dict):
+                self.records.append(self._record_from_cache(cache, kwargs))
+            return result
+
+        self.adapter.forward = traced_forward
+        self.installed = True
+
+    def start_sample(self, context: dict[str, Any]):
+        self.sample_context = dict(context)
+        self.step = 0
+
+    def _record_from_cache(self, cache: dict[str, Any], kwargs: dict[str, Any]) -> dict[str, Any]:
+        dense_batch = _dense_expert_weights(cache, self.num_experts)
+        first_dense = dense_batch[0] if dense_batch else [0.0 for _ in range(self.num_experts)]
+        route_logits_batch = _dense_cache_vectors(cache, "route_logits", self.num_experts)
+        first_route_logits = route_logits_batch[0] if route_logits_batch else []
+        return {
+            **self.sample_context,
+            "step": int(self.step),
+            "sigma": _tensor_to_python(kwargs.get("sigma")),
+            "label_ids": _tensor_to_python(cache.get("label_ids")),
+            "active_label_ids": _tensor_to_python(cache.get("active_label_ids")),
+            "active_expert_indices": _tensor_to_python(cache.get("active_expert_indices")),
+            "active_expert_weights": _tensor_to_python(cache.get("active_expert_weights")),
+            "router_topk_weights": _tensor_to_python(cache.get("router_topk_weights")),
+            "route_logits": _tensor_to_python(cache.get("route_logits")),
+            "route_logits_10d": [float(x) for x in first_route_logits],
+            "route_logits_10d_batch": route_logits_batch,
+            "router_logits_10d": [float(x) for x in first_route_logits],
+            "expert_weights_10d": [float(x) for x in first_dense],
+            "expert_weights_10d_batch": dense_batch,
+            "phenomenon_labels": PHENOMENON_LABELS,
+        }
+
+
+def collapse_router_forward_records(records: list[dict[str, Any]], expected_steps: int) -> list[dict[str, Any]]:
+    if expected_steps <= 0 or len(records) <= expected_steps:
+        return records
+    if len(records) % expected_steps != 0:
+        return records
+    group_size = len(records) // expected_steps
+    collapsed = []
+    for step_idx in range(expected_steps):
+        chunk = records[step_idx * group_size:(step_idx + 1) * group_size]
+        base = dict(chunk[-1])
+        vectors = [row.get("expert_weights_10d", []) for row in chunk]
+        if all(isinstance(vec, list) and len(vec) == len(PHENOMENON_LABELS) for vec in vectors):
+            mean_vec = [
+                float(sum(vec[i] for vec in vectors) / len(vectors))
+                for i in range(len(PHENOMENON_LABELS))
+            ]
+            base["expert_weights_10d"] = mean_vec
+            base["expert_weights_10d_batch"] = [mean_vec]
+        logits_vectors = [row.get("route_logits_10d", []) for row in chunk]
+        if all(isinstance(vec, list) and len(vec) == len(PHENOMENON_LABELS) for vec in logits_vectors):
+            mean_logits = [
+                float(sum(vec[i] for vec in logits_vectors) / len(logits_vectors))
+                for i in range(len(PHENOMENON_LABELS))
+            ]
+            base["route_logits_10d"] = mean_logits
+            base["route_logits_10d_batch"] = [mean_logits]
+            base["router_logits_10d"] = mean_logits
+        base["step"] = step_idx + 1
+        base["forward_calls_collapsed"] = group_size
+        base["raw_forward_steps"] = [row.get("step") for row in chunk]
+        collapsed.append(base)
+    return collapsed
+
+
+def append_router_trace(path: Path, records: list[dict[str, Any]]):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as f:
+        for record in records:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="批量生成视频 - 从CSV读取caption，支持ID范围多卡并行"
@@ -327,6 +657,12 @@ def main():
         type=str,
         default="output_videos",
         help="输出目录",
+    )
+    parser.add_argument(
+        "--sample_ids",
+        type=str,
+        default=None,
+        help="逗号/空格分隔的 1-based CSV ID；设置为 router30 使用四类物理均衡子集。",
     )
 
     # 模型
@@ -369,6 +705,24 @@ def main():
         action="store_true",
         help="Run full Wan inference but only record encoder observable diagnostics; do not apply adapter correction to v_original.",
     )
+    parser.add_argument(
+        "--moe_top_k",
+        type=int,
+        default=None,
+        help="Override checkpoint MoE active expert count at runtime. Allows 0.",
+    )
+    parser.add_argument(
+        "--excluded_expert_names",
+        type=str,
+        default="",
+        help='Comma-separated expert names to exclude from routing and auto labels, e.g. "Granular,Fracture".',
+    )
+    parser.add_argument(
+        "--performance_metrics_path",
+        type=str,
+        default=None,
+        help="JSONL path for per-sample generation/save/time/memory records. Default: output_dir/performance_metrics.jsonl.",
+    )
 
     # 设备
     parser.add_argument("--device", type=str, default="cuda")
@@ -391,7 +745,7 @@ def main():
     )
     parser.add_argument("--llm_model", type=str, default=DEFAULT_LLM_MODEL, help="LLM model name. Falls back to OPENAI_MODEL or LLM_MODEL.")
     parser.add_argument("--llm_base_url", type=str, default=DEFAULT_LLM_BASE_URL, help="OpenAI-compatible base URL. Falls back to OPENAI_BASE_URL or LLM_BASE_URL.")
-    parser.add_argument("--llm_api_key", type=str, default=None, help="Optional direct API key. Prefer env vars for security.")
+    parser.add_argument("--llm_api_key", type=str, default=None, help="Optional direct API key. Prefer env vars for normal batch runs.")
     parser.add_argument("--llm_api_key_env", type=str, default="OPENAI_API_KEY", help="Environment variable name that stores the API key.")
     parser.add_argument("--llm_timeout", type=float, default=30.0, help="LLM request timeout in seconds.")
     parser.add_argument("--llm_max_retries", type=int, default=2, help="Maximum retry count for LLM requests.")
@@ -411,8 +765,27 @@ def main():
         action="store_true",
         help="断点续跑：扫描输出目录，仅生成范围内缺失的 ID",
     )
+    parser.add_argument("--export_router_trace", action="store_true", help="导出真实 PINN adapter router trace JSONL。")
+    parser.add_argument("--router_trace_only", action="store_true", help="只保存 router trace，不保存视频文件。")
+    parser.add_argument("--router_trace_path", type=str, default=None, help="router trace JSONL 输出路径；默认 output_dir/router_trace.jsonl。")
+    parser.add_argument("--append_router_trace", action="store_true", help="允许向已有 router trace JSONL 追加。")
 
     args = parser.parse_args()
+    excluded_expert_names = parse_excluded_expert_names(args.excluded_expert_names)
+    allowed_labels = allowed_phenomenon_labels(excluded_expert_names)
+    if args.moe_top_k is not None:
+        if args.moe_top_k < 0:
+            print(f"Error: --moe_top_k must be >= 0, got {args.moe_top_k}")
+            sys.exit(1)
+        if args.moe_top_k > len(allowed_labels):
+            print(
+                f"Error: --moe_top_k={args.moe_top_k} exceeds available experts "
+                f"after exclusions ({len(allowed_labels)}): {allowed_labels}"
+            )
+            sys.exit(1)
+    export_router_trace = bool(args.export_router_trace or args.router_trace_only)
+    if export_router_trace and args.llm_api_key is None:
+        args.llm_api_key = _default_inference_llm_api_key()
 
     # 解析路径
     csv_path = Path(args.csv)
@@ -422,6 +795,24 @@ def main():
     if not output_dir.is_absolute():
         output_dir = project_root / output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
+    performance_metrics_path = (
+        Path(args.performance_metrics_path)
+        if args.performance_metrics_path
+        else output_dir / "performance_metrics.jsonl"
+    )
+    if not performance_metrics_path.is_absolute():
+        performance_metrics_path = project_root / performance_metrics_path
+    performance_metrics_path.parent.mkdir(parents=True, exist_ok=True)
+    router_trace_path = None
+    if export_router_trace:
+        router_trace_path = Path(args.router_trace_path) if args.router_trace_path else output_dir / "router_trace.jsonl"
+        if not router_trace_path.is_absolute():
+            router_trace_path = project_root / router_trace_path
+        router_trace_path.parent.mkdir(parents=True, exist_ok=True)
+        if router_trace_path.exists() and not args.append_router_trace:
+            print(f"Error: router trace already exists: {router_trace_path}")
+            print("Use --append_router_trace or choose a new --router_trace_path/--output_dir.")
+            sys.exit(1)
 
     if not csv_path.exists():
         print(f"Error: CSV not found: {csv_path}")
@@ -434,17 +825,35 @@ def main():
         print("Error: No captions found in CSV")
         sys.exit(1)
 
-    # 校验范围
-    start_id = max(1, args.start_id)
-    end_id = min(total, args.end_id)
-    if start_id > end_id:
-        print(f"Error: start_id ({start_id}) > end_id ({end_id}) or out of range [1, {total}]")
-        sys.exit(1)
+    sample_ids = parse_sample_ids(args.sample_ids)
+    if sample_ids:
+        invalid_ids = [vid_id for vid_id in sample_ids if vid_id < 1 or vid_id > total]
+        if invalid_ids:
+            print(f"Error: sample_ids out of range [1, {total}]: {invalid_ids}")
+            sys.exit(1)
+        selected_id_list = list(dict.fromkeys(sample_ids))
+        start_id = min(selected_id_list)
+        end_id = max(selected_id_list)
+    else:
+        start_id = max(1, args.start_id)
+        end_id = min(total, args.end_id)
+        if start_id > end_id:
+            print(f"Error: start_id ({start_id}) > end_id ({end_id}) or out of range [1, {total}]")
+            sys.exit(1)
+        selected_id_list = list(range(start_id, end_id + 1))
 
     print("=" * 80)
     print(f"Batch PINN Inference: IDs {start_id}-{end_id} / {total} total")
+    if sample_ids:
+        print(f"Selected sample IDs: {selected_id_list}")
     print(f"CSV: {csv_path}")
     print(f"Output: {output_dir}")
+    print(f"MoE top-k override: {args.moe_top_k if args.moe_top_k is not None else 'checkpoint default'}")
+    print(f"Excluded experts: {excluded_expert_names if excluded_expert_names else 'none'}")
+    print(f"Allowed auto-label experts: {allowed_labels}")
+    print(f"Performance metrics: {performance_metrics_path}")
+    if export_router_trace:
+        print(f"Router trace: {router_trace_path}")
     print("=" * 80)
 
     # 1. 加载模型（只加载一次）
@@ -464,11 +873,21 @@ def main():
         device=args.device,
         enable_tracking=True,
         observable_inspection_only=args.observable_inspection_only,
+        moe_top_k_override=args.moe_top_k,
+        excluded_expert_names=excluded_expert_names,
     )
+    router_hook = None
+    if export_router_trace:
+        if pipe.physics_adapter is None:
+            raise RuntimeError("Cannot export router trace because physics_adapter is not loaded.")
+        router_hook = RouterTraceHook(pipe.physics_adapter)
+        router_hook.install()
+        print("  Router trace hook installed on PhysicsAdapter.forward")
     global_metadata, global_mode = load_global_metadata(
         metadata_json=args.metadata_json,
         metadata_csv=args.metadata_csv,
     )
+    global_metadata = sanitize_metadata_labels(global_metadata, excluded_expert_names)
     if global_metadata is not None:
         print(f"  Using global PINN metadata (mode={global_mode}).")
     prompt_refiner = None
@@ -484,7 +903,7 @@ def main():
     llm_inferer = None
     if args.auto_label_from_prompt:
         llm_inferer = PromptPhysicsLabelInferer(
-            PHENOMENON_LABELS,
+            allowed_labels,
             model=args.llm_model,
             base_url=args.llm_base_url,
             api_key=args.llm_api_key,
@@ -493,11 +912,21 @@ def main():
             max_retries=args.llm_max_retries,
             default_label="Fluid",
         )
+    effective_moe_top_k = (
+        int(getattr(pipe.physics_adapter, "moe_top_k"))
+        if pipe.physics_adapter is not None and hasattr(pipe.physics_adapter, "moe_top_k")
+        else args.moe_top_k
+    )
+    effective_excluded_expert_names = (
+        list(getattr(pipe.physics_adapter, "excluded_expert_names", excluded_expert_names))
+        if pipe.physics_adapter is not None
+        else list(excluded_expert_names)
+    )
 
     ids_to_process: Iterable[int]
     if args.resume:
         existing_ids = scan_existing_ids(output_dir)
-        ids_to_process = [i for i in range(start_id, end_id + 1) if i not in existing_ids]
+        ids_to_process = [i for i in selected_id_list if i not in existing_ids]
         print(
             f"[3/3] Resume enabled: existing {len(existing_ids)} files, "
             f"remaining {len(ids_to_process)} in range"
@@ -506,7 +935,7 @@ def main():
             print("All done in range. Nothing to generate.")
             return
     else:
-        ids_to_process = range(start_id, end_id + 1)
+        ids_to_process = selected_id_list
 
     print(f"[3/3] Generating videos {start_id}-{end_id}...")
     for vid_id in ids_to_process:
@@ -518,6 +947,26 @@ def main():
 
         if args.skip_existing and out_path.exists():
             print(f"  [{vid_id:4d}/{total}] Skip (exists): {out_name}")
+            if not performance_record_exists(performance_metrics_path, vid_id):
+                append_performance_record(performance_metrics_path, {
+                    "sample_id": int(vid_id),
+                    "output_path": str(out_path),
+                    "skipped": True,
+                    "success": True,
+                    "error": None,
+                    "model_id": args.model_id,
+                    "checkpoint_path": str(args.checkpoint_path),
+                    "requested_moe_top_k": args.moe_top_k,
+                    "moe_top_k": effective_moe_top_k,
+                    "excluded_expert_names": effective_excluded_expert_names,
+                    "gpu_id": os.getenv("CUDA_VISIBLE_DEVICES", ""),
+                    "cuda_device_index": int(torch.cuda.current_device()) if torch.cuda.is_available() else None,
+                    "generation_seconds": None,
+                    "save_seconds": None,
+                    "total_seconds": None,
+                    "peak_memory_allocated_gb": None,
+                    "peak_memory_reserved_gb": None,
+                })
             continue
 
         seed = args.seed
@@ -540,6 +989,7 @@ def main():
                 default_label="Fluid",
             )
             metadata_mode = "llm_auto_label"
+        pinn_metadata = sanitize_metadata_labels(pinn_metadata, excluded_expert_names)
         print(f"  [{vid_id:4d}/{total}] {original_caption[:60]}{'...' if len(original_caption) > 60 else ''} -> {out_name}")
         if prompt_refinement is not None:
             if prompt_refinement.get("used_refinement"):
@@ -562,8 +1012,35 @@ def main():
             if llm_result.get("error"):
                 print(f"    llm warning: {llm_result['error']}")
 
+        total_start = time.perf_counter()
+        generation_seconds = None
+        save_seconds = None
+        total_seconds = None
+        peak_allocated_gb = None
+        peak_reserved_gb = None
         try:
             pipe.reset_tracking()
+            cuda_synchronize_if_needed(args.device)
+            reset_cuda_peak_memory_if_needed(args.device)
+            trace_start = len(router_hook.records) if router_hook is not None else 0
+            if router_hook is not None:
+                router_hook.start_sample({
+                    "sample_id": int(vid_id),
+                    "prompt": original_caption,
+                    "effective_prompt": effective_prompt,
+                    "metadata_mode": metadata_mode,
+                    "metadata": pinn_metadata,
+                    "llm_result": llm_result if isinstance(llm_result, dict) else None,
+                    "llm_labels": llm_result.get("labels") if isinstance(llm_result, dict) else None,
+                    "model_id": args.model_id,
+                    "checkpoint_path": str(args.checkpoint_path),
+                    "requested_moe_top_k": args.moe_top_k,
+                    "moe_top_k": effective_moe_top_k,
+                    "excluded_expert_names": effective_excluded_expert_names,
+                    "num_inference_steps": int(args.num_inference_steps),
+                    "seed": int(seed),
+                })
+            generation_start = time.perf_counter()
             video = pipe(
                 prompt=effective_prompt,
                 negative_prompt=args.negative_prompt,
@@ -576,8 +1053,93 @@ def main():
                 tiled=True,
                 pinn_metadata=pinn_metadata,
             )
-            save_video(video, str(out_path), fps=args.fps, quality=args.quality)
+            cuda_synchronize_if_needed(args.device)
+            generation_seconds = time.perf_counter() - generation_start
+            if router_hook is not None and router_trace_path is not None:
+                trace_records = router_hook.records[trace_start:]
+                trace_records = collapse_router_forward_records(trace_records, args.num_inference_steps)
+                append_router_trace(router_trace_path, trace_records)
+                if len(trace_records) != args.num_inference_steps:
+                    print(
+                        f"    router trace warning: wrote {len(trace_records)} rows, "
+                        f"expected {args.num_inference_steps}"
+                    )
+            save_start = time.perf_counter()
+            if not args.router_trace_only:
+                save_video(video, str(out_path), fps=args.fps, quality=args.quality)
+                cuda_synchronize_if_needed(args.device)
+                save_seconds = time.perf_counter() - save_start
+            else:
+                save_seconds = 0.0
+            total_seconds = time.perf_counter() - total_start
+            peak_allocated_gb, peak_reserved_gb = cuda_memory_gb(args.device)
+            append_performance_record(performance_metrics_path, {
+                "sample_id": int(vid_id),
+                "output_path": str(out_path),
+                "skipped": False,
+                "success": True,
+                "error": None,
+                "prompt": original_caption,
+                "effective_prompt": effective_prompt,
+                "metadata_mode": metadata_mode,
+                "metadata_label_ids": pinn_metadata.get("label_ids") if isinstance(pinn_metadata, dict) else None,
+                "metadata_label_name": pinn_metadata.get("label_name") if isinstance(pinn_metadata, dict) else None,
+                "model_id": args.model_id,
+                "checkpoint_path": str(args.checkpoint_path),
+                "requested_moe_top_k": args.moe_top_k,
+                "moe_top_k": effective_moe_top_k,
+                "excluded_expert_names": effective_excluded_expert_names,
+                "num_inference_steps": int(args.num_inference_steps),
+                "seed": int(seed),
+                "height": int(args.height),
+                "width": int(args.width),
+                "num_frames": int(args.num_frames),
+                "fps": int(args.fps),
+                "gpu_id": os.getenv("CUDA_VISIBLE_DEVICES", ""),
+                "cuda_device_index": int(torch.cuda.current_device()) if torch.cuda.is_available() else None,
+                "generation_seconds": generation_seconds,
+                "save_seconds": save_seconds,
+                "total_seconds": total_seconds,
+                "peak_memory_allocated_gb": peak_allocated_gb,
+                "peak_memory_reserved_gb": peak_reserved_gb,
+            })
         except Exception as e:
+            try:
+                cuda_synchronize_if_needed(args.device)
+                peak_allocated_gb, peak_reserved_gb = cuda_memory_gb(args.device)
+            except Exception:
+                pass
+            total_seconds = time.perf_counter() - total_start
+            append_performance_record(performance_metrics_path, {
+                "sample_id": int(vid_id),
+                "output_path": str(out_path),
+                "skipped": False,
+                "success": False,
+                "error": str(e),
+                "prompt": original_caption,
+                "effective_prompt": effective_prompt,
+                "metadata_mode": metadata_mode,
+                "metadata_label_ids": pinn_metadata.get("label_ids") if isinstance(pinn_metadata, dict) else None,
+                "metadata_label_name": pinn_metadata.get("label_name") if isinstance(pinn_metadata, dict) else None,
+                "model_id": args.model_id,
+                "checkpoint_path": str(args.checkpoint_path),
+                "requested_moe_top_k": args.moe_top_k,
+                "moe_top_k": effective_moe_top_k,
+                "excluded_expert_names": effective_excluded_expert_names,
+                "num_inference_steps": int(args.num_inference_steps),
+                "seed": int(seed),
+                "height": int(args.height),
+                "width": int(args.width),
+                "num_frames": int(args.num_frames),
+                "fps": int(args.fps),
+                "gpu_id": os.getenv("CUDA_VISIBLE_DEVICES", ""),
+                "cuda_device_index": int(torch.cuda.current_device()) if torch.cuda.is_available() else None,
+                "generation_seconds": generation_seconds,
+                "save_seconds": save_seconds,
+                "total_seconds": total_seconds,
+                "peak_memory_allocated_gb": peak_allocated_gb,
+                "peak_memory_reserved_gb": peak_reserved_gb,
+            })
             print(f"  [{vid_id:4d}/{total}] ERROR: {e}")
             if args.continue_on_error:
                 continue

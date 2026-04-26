@@ -25,6 +25,16 @@ ONLY_U_RECOVERY_FIELDS = {
     "psi": ("d", "alpha", "T", "j", "D", "psi"),
 }
 
+CORE_ABLATION_MODES = (
+    "full",
+    "generic_latent_correction",
+    "wo_explicit_physical_interface",
+    "wo_pde_residuals",
+    "wo_phenomenon_specific_operators",
+    "wo_learned_expert_routing",
+    "wo_physics_to_flow_injection",
+)
+
 
 class ResBlock3D(nn.Module):
     """
@@ -86,6 +96,8 @@ class PhysicsAdapter(nn.Module):
         rl_hidden_dim=None,
         rl_reward_decay=0.95,
         strict_physical_state_contract=False,
+        excluded_expert_names=None,
+        core_ablation_mode="full",
     ):
         super().__init__()
 
@@ -97,11 +109,17 @@ class PhysicsAdapter(nn.Module):
         self.q_input_dim = q_input_dim
         self.n_text_vocab_size = n_text_vocab_size
         self.shared_expert_weight = shared_expert_weight
-        self.moe_top_k = max(1, min(int(moe_top_k), num_phenomena))
+        self.moe_top_k = max(0, min(int(moe_top_k), num_phenomena))
         self.router_temperature = 2.0  # Increased for smoother routing
         self.router_label_bias = 2.0
         self.use_moe = True
         self.label_only_mode = False
+        self.core_ablation_mode = "full"
+        self.interpret_attribute_bank_as_physical = True
+        self.use_phenomenon_specific_operators = True
+        self.physics_to_flow_injection_enabled = True
+        self.force_label_only_routing = False
+        self.set_core_ablation_mode(core_ablation_mode)
         if self.physics_attr_dim != PHYSICS_ATTR_DIM:
             raise ValueError(
                 f"Explicit attribute-bank v2 requires physics_attr_dim={PHYSICS_ATTR_DIM}, "
@@ -116,6 +134,9 @@ class PhysicsAdapter(nn.Module):
         self.expert_field_recipes = {
             label: tuple(EXPERT_FIELD_RECIPES[label]) for label in self.phenomenon_labels
         }
+        self.excluded_expert_names = []
+        self.excluded_expert_indices = set()
+        self.set_excluded_experts(excluded_expert_names)
         self.pde_residuals = pde_residuals  # Reference to PDE residuals module
         self.apply_constraints_in_forward = True  # Enable constraint application
         self.constraint_step_size = 0.01  # Small step size for constraint enforcement
@@ -139,6 +160,8 @@ class PhysicsAdapter(nn.Module):
         self.rl_hidden_dim = hidden_dim if rl_hidden_dim is None else max(int(rl_hidden_dim), 8)
         self.rl_reward_decay = min(max(float(rl_reward_decay), 0.0), 0.999)
         self.strict_physical_state_contract = bool(strict_physical_state_contract)
+        self.export_expert_attention = False
+        self.expert_attention_apply_router_weight = True
 
         # 唯一共享 encoder：所有物理语义都先进入同一套共享特征空间。
         self.physics_encoder_shared = nn.Sequential(
@@ -672,8 +695,9 @@ class PhysicsAdapter(nn.Module):
         label_ids_list = metadata.get("label_ids")
         if label_ids_list is not None and len(label_ids_list) > 0:
             # label_ids_list 是列表，为每个 batch 元素复制相同的标签列表
+            filtered_label_ids = self._filter_excluded_label_ids(label_ids_list)
             labels_per_sample = [
-                [int(lid) for lid in label_ids_list]
+                list(filtered_label_ids)
                 for _ in range(batch_size)
             ]
             return labels_per_sample
@@ -686,7 +710,8 @@ class PhysicsAdapter(nn.Module):
             label_id = int(label_id.item())
         else:
             label_id = int(label_id) if label_id is not None else 0
-        return [[label_id] for _ in range(batch_size)]
+        filtered_label_ids = self._filter_excluded_label_ids([label_id])
+        return [list(filtered_label_ids) for _ in range(batch_size)]
 
     def _fit_2d(self, tensor, target_dim, batch_size, device, dtype):
         if tensor is None:
@@ -791,6 +816,70 @@ class PhysicsAdapter(nn.Module):
                 f"Expert index {expert_idx} is out of range for {len(self.phenomenon_labels)} experts."
             )
         return self.phenomenon_labels[expert_idx]
+
+    def _parse_excluded_expert_names(self, excluded_expert_names):
+        if excluded_expert_names is None:
+            return []
+        if isinstance(excluded_expert_names, str):
+            parts = [
+                part.strip()
+                for part in excluded_expert_names.replace(";", ",").split(",")
+                if part.strip()
+            ]
+        else:
+            parts = [str(part).strip() for part in excluded_expert_names if str(part).strip()]
+        lookup = {label.casefold(): label for label in self.phenomenon_labels}
+        unknown = [part for part in parts if part.casefold() not in lookup]
+        if unknown:
+            raise ValueError(
+                f"Unknown excluded expert names: {unknown}. "
+                f"Known experts: {self.phenomenon_labels}."
+            )
+        normalized = []
+        seen = set()
+        for part in parts:
+            canonical = lookup[part.casefold()]
+            if canonical not in seen:
+                normalized.append(canonical)
+                seen.add(canonical)
+        return normalized
+
+    def set_excluded_experts(self, excluded_expert_names=None):
+        names = self._parse_excluded_expert_names(excluded_expert_names)
+        self.excluded_expert_names = names
+        self.excluded_expert_indices = {
+            idx for idx, label in enumerate(self.phenomenon_labels) if label in names
+        }
+
+    def _default_allowed_label_id(self):
+        for preferred in ("Fluid", "Rigid Body"):
+            if preferred in self.phenomenon_labels:
+                idx = self.phenomenon_labels.index(preferred)
+                if idx not in self.excluded_expert_indices:
+                    return idx
+        for idx in range(self.num_phenomena):
+            if idx not in self.excluded_expert_indices:
+                return idx
+        return 0
+
+    def _filter_excluded_label_ids(self, label_ids):
+        filtered = []
+        seen = set()
+        for label_id in label_ids:
+            label_id = int(label_id)
+            if label_id < 0 or label_id >= self.num_phenomena:
+                continue
+            if label_id in self.excluded_expert_indices:
+                continue
+            if label_id not in seen:
+                filtered.append(label_id)
+                seen.add(label_id)
+        if not filtered:
+            filtered = [self._default_allowed_label_id()]
+        return filtered
+
+    def _available_expert_count(self):
+        return max(self.num_phenomena - len(self.excluded_expert_indices), 0)
 
     def expert_field_mask(self, expert_idx, device=None, dtype=None):
         mask = self.expert_field_masks[int(expert_idx)]
@@ -1310,6 +1399,8 @@ class PhysicsAdapter(nn.Module):
                 f"Operator expert output channel mismatch: expected {self.physics_attr_dim}, "
                 f"got {operator_output.shape[1]}."
             )
+        if not self.interpret_attribute_bank_as_physical:
+            return self._safe_physical_tensor(operator_output, update_name)
         expert_mask = self.expert_field_mask(
             expert_idx,
             device=operator_output.device,
@@ -1337,7 +1428,15 @@ class PhysicsAdapter(nn.Module):
         active_label_ids = self._labels_to_padded_tensor(labels_per_sample, device=device)
         if active_label_ids is not None:
             self.set_debug_context(active_label_ids=active_label_ids.detach())
-        route_logits = self.expert_router(cond_feat)
+        if self.label_only_mode or self.force_label_only_routing:
+            route_logits = torch.zeros(
+                batch_size,
+                self.num_phenomena,
+                device=device,
+                dtype=cond_feat.dtype,
+            )
+        else:
+            route_logits = self.expert_router(cond_feat)
         route_logits = self._require_tensor(route_logits, "route_logits_raw", expected_channels=self.num_phenomena)
         label_prior = torch.zeros_like(route_logits)
 
@@ -1350,13 +1449,39 @@ class PhysicsAdapter(nn.Module):
 
         route_logits = route_logits + label_prior
         route_logits = self._require_tensor(route_logits, "route_logits", expected_channels=self.num_phenomena)
+        if self.excluded_expert_indices:
+            excluded_mask = torch.zeros(
+                self.num_phenomena,
+                device=route_logits.device,
+                dtype=torch.bool,
+            )
+            excluded_mask[list(sorted(self.excluded_expert_indices))] = True
+            route_logits = route_logits.masked_fill(
+                excluded_mask.unsqueeze(0),
+                torch.finfo(route_logits.dtype).min,
+            )
+            route_logits = self._require_tensor(
+                route_logits,
+                "route_logits_excluded_masked",
+                expected_channels=self.num_phenomena,
+            )
 
-        top_k = min(self.moe_top_k, self.num_phenomena)
-        topk_logits, topk_indices = torch.topk(route_logits, k=top_k, dim=-1)
-        topk_logits = self._require_tensor(topk_logits, "topk_logits", expected_channels=top_k)
-        topk_weights = torch.softmax(topk_logits / max(self.router_temperature, 1e-6), dim=-1)
-        topk_weights = self._require_tensor(topk_weights, "topk_weights", expected_channels=top_k)
-        dominant_expert = topk_indices[:, 0]
+        top_k = min(self.moe_top_k, self._available_expert_count())
+        if top_k > 0:
+            topk_logits, topk_indices = torch.topk(route_logits, k=top_k, dim=-1)
+            topk_logits = self._require_tensor(topk_logits, "topk_logits", expected_channels=top_k)
+            topk_weights = torch.softmax(topk_logits / max(self.router_temperature, 1e-6), dim=-1)
+            topk_weights = self._require_tensor(topk_weights, "topk_weights", expected_channels=top_k)
+            dominant_expert = topk_indices[:, 0]
+        else:
+            topk_indices = torch.empty(batch_size, 0, device=device, dtype=torch.long)
+            topk_weights = torch.empty(batch_size, 0, device=device, dtype=route_logits.dtype)
+            dominant_expert = torch.full(
+                (batch_size,),
+                -1,
+                device=device,
+                dtype=torch.long,
+            )
         offlabel_selected_experts = self._offlabel_selected_experts(topk_indices, labels_per_sample)
         self.set_debug_context(
             selected_topk_experts=topk_indices.detach(),
@@ -1514,7 +1639,9 @@ class PhysicsAdapter(nn.Module):
             expected_channels=self.hidden_dim,
         )
 
-        if self.strict_physical_state_contract and (metadata is None or not self.use_moe):
+        effective_use_moe = bool(self.use_moe and self.core_ablation_mode != "generic_latent_correction")
+        requires_explicit_contract = bool(self.interpret_attribute_bank_as_physical)
+        if self.strict_physical_state_contract and requires_explicit_contract and (metadata is None or not effective_use_moe):
             reason = "metadata is None" if metadata is None else "MoE routing is disabled"
             raise RuntimeError(
                 f"Strict physical-state contract forbids shared fallback because {reason}."
@@ -1537,7 +1664,7 @@ class PhysicsAdapter(nn.Module):
         dominant_expert = None
         label_ids = None
         active_label_ids = None
-        using_shared_fallback = metadata is None or not self.use_moe
+        using_shared_fallback = metadata is None or not effective_use_moe
         fallback_reason = None
         branch_attribute_updates = None
         offlabel_selected_experts = None
@@ -1631,7 +1758,12 @@ class PhysicsAdapter(nn.Module):
                         expert_idx=expert_idx,
                         expert_name=self.phenomenon_name_from_index(expert_idx),
                     )
-                    operator_output = self.operator_experts[expert_idx](sample_input)
+                    operator_module_idx = (
+                        expert_idx
+                        if self.use_phenomenon_specific_operators
+                        else 0
+                    )
+                    operator_output = self.operator_experts[operator_module_idx](sample_input)
                     operator_output = self._require_tensor(
                         operator_output,
                         f"branch_attribute_update_expert_{expert_idx}_source",
@@ -1656,7 +1788,8 @@ class PhysicsAdapter(nn.Module):
 
             with torch.no_grad():
                 hist = torch.zeros(self.num_phenomena, device=v_original.device, dtype=torch.float32)
-                hist.scatter_add_(0, topk_indices.reshape(-1), topk_weights.reshape(-1).float())
+                if topk_indices.numel() > 0:
+                    hist.scatter_add_(0, topk_indices.reshape(-1), topk_weights.reshape(-1).float())
                 hist = hist / max(float(B), 1.0)
                 self.expert_usage_ema.mul_(0.99).add_(0.01 * hist)
             self.set_debug_context(
@@ -1705,19 +1838,45 @@ class PhysicsAdapter(nn.Module):
         )
         raw_correction = self.shared_decoder(decoder_input)
         raw_correction = self._safe_correction(raw_correction)
-        v_corrected = v_original + raw_correction
+        injected_correction = raw_correction
+        if not self.physics_to_flow_injection_enabled:
+            injected_correction = raw_correction * 0.0
+        v_corrected = v_original + injected_correction
+        expert_correction_maps = None
+        if self.export_expert_attention and isinstance(branch_attribute_updates, torch.Tensor):
+            expert_correction_maps = self._compute_expert_correction_maps(
+                v_original=v_original,
+                physics_feat_shared=physics_feat_shared,
+                cond_feat=cond_feat,
+                shared_attribute_bank=shared_attribute_bank,
+                branch_attribute_updates=branch_attribute_updates,
+                topk_weights=topk_weights,
+                apply_router_weight=self.expert_attention_apply_router_weight,
+                metadata=metadata,
+            )
 
-        correction_norm = raw_correction.detach().float().reshape(B, -1).norm(dim=1)
+        raw_correction_norm = raw_correction.detach().float().reshape(B, -1).norm(dim=1)
+        injected_correction_norm = injected_correction.detach().float().reshape(B, -1).norm(dim=1)
         sigma_gate = torch.ones(B, device=v_original.device, dtype=v_original.dtype)
         effective_scale = torch.ones(B, device=v_original.device, dtype=v_original.dtype)
 
         self._cache = {
+            "core_ablation_mode": self.core_ablation_mode,
+            "interpret_attribute_bank_as_physical": bool(self.interpret_attribute_bank_as_physical),
+            "use_phenomenon_specific_operators": bool(self.use_phenomenon_specific_operators),
+            "physics_to_flow_injection_enabled": bool(self.physics_to_flow_injection_enabled),
+            "force_label_only_routing": bool(self.force_label_only_routing),
             "using_shared_fallback": using_shared_fallback,
             "fallback_reason": fallback_reason,
+            "moe_top_k": int(self.moe_top_k),
+            "excluded_expert_names": list(self.excluded_expert_names),
+            "excluded_expert_indices": sorted(int(idx) for idx in self.excluded_expert_indices),
             "physics_feat": physics_feat_shared.detach(),
             "physics_feat_live": physics_feat_shared,
             "raw_correction": raw_correction.detach(),
             "raw_correction_live": raw_correction,
+            "injected_correction": injected_correction.detach(),
+            "injected_correction_live": injected_correction,
             "cond_feat": cond_feat.detach(),
             "cond_feat_live": cond_feat,
             "sigma_embedding": sigma_embed.detach(),
@@ -1757,6 +1916,7 @@ class PhysicsAdapter(nn.Module):
                 if isinstance(branch_attribute_updates, torch.Tensor) else None
             ),
             "branch_attribute_updates_live": branch_attribute_updates,
+            "expert_correction_maps": expert_correction_maps,
             # Compatibility aliases for downstream tooling migrating from shared-slots v1.
             "shared_x_phys": shared_attribute_bank.detach(),
             "shared_x_phys_live": shared_attribute_bank,
@@ -1774,12 +1934,102 @@ class PhysicsAdapter(nn.Module):
             "route_logits": route_logits.detach() if isinstance(route_logits, torch.Tensor) else None,
             "sigma_gate": sigma_gate,
             "effective_scale": effective_scale,
-            "raw_correction_norm": correction_norm,
-            "gated_correction_norm": correction_norm,
-            "correction_norm": correction_norm,
+            "raw_correction_norm": raw_correction_norm,
+            "gated_correction_norm": injected_correction_norm,
+            "correction_norm": injected_correction_norm,
         }
 
         return v_corrected
+
+    def _compute_expert_correction_maps(
+        self,
+        v_original,
+        physics_feat_shared,
+        cond_feat,
+        shared_attribute_bank,
+        branch_attribute_updates,
+        topk_weights,
+        apply_router_weight=True,
+        metadata=None,
+    ):
+        """
+        Decode each active expert's weighted attribute delta into an independent
+        spatial correction contribution map: abs(correction_e - correction_base).mean(C).
+        The returned tensor is CPU float32 with shape [B, K, T, H, W].
+        """
+        if branch_attribute_updates.numel() == 0 or topk_weights.numel() == 0:
+            return None
+        B, topk = branch_attribute_updates.shape[:2]
+        maps_per_batch = []
+        with torch.no_grad():
+            for sample_idx in range(B):
+                sample_physics = physics_feat_shared[sample_idx:sample_idx + 1]
+                sample_cond = cond_feat[sample_idx:sample_idx + 1]
+                sample_cond_map = sample_cond.view(1, self.hidden_dim, 1, 1, 1).expand(
+                    -1, -1, *sample_physics.shape[2:]
+                )
+                sample_v = v_original[sample_idx:sample_idx + 1].to(dtype=sample_physics.dtype)
+                base_bank = shared_attribute_bank[sample_idx:sample_idx + 1].to(
+                    device=sample_physics.device,
+                    dtype=sample_physics.dtype,
+                )
+                base_bank = self._prepare_attribute_bank_for_decode(
+                    base_bank,
+                    sample_physics,
+                    metadata=metadata,
+                    name="expert_attention_base_bank",
+                )
+                base_input = torch.cat(
+                    [sample_physics, sample_cond_map, base_bank, sample_v],
+                    dim=1,
+                )
+                base_correction = self._safe_correction(self.shared_decoder(base_input))
+
+                maps_per_slot = []
+                for slot_idx in range(topk):
+                    weight = topk_weights[sample_idx, slot_idx].to(
+                        device=sample_physics.device,
+                        dtype=sample_physics.dtype,
+                    )
+                    delta_attr = branch_attribute_updates[sample_idx:sample_idx + 1, slot_idx].to(
+                        device=sample_physics.device,
+                        dtype=sample_physics.dtype,
+                    )
+                    branch_bank = shared_attribute_bank[sample_idx:sample_idx + 1].to(
+                        device=sample_physics.device,
+                        dtype=sample_physics.dtype,
+                    )
+                    delta_scale = weight if apply_router_weight else torch.ones_like(weight)
+                    branch_bank = self._safe_physical_tensor(
+                        branch_bank + delta_scale * delta_attr,
+                        "expert_attention_branch_bank",
+                    )
+                    branch_bank = self._prepare_attribute_bank_for_decode(
+                        branch_bank,
+                        sample_physics,
+                        metadata=metadata,
+                        name="expert_attention_branch_bank_decoded",
+                    )
+                    branch_input = torch.cat(
+                        [sample_physics, sample_cond_map, branch_bank, sample_v],
+                        dim=1,
+                    )
+                    branch_correction = self._safe_correction(self.shared_decoder(branch_input))
+                    contrib = (branch_correction - base_correction).abs().mean(dim=1)[0]
+                    maps_per_slot.append(contrib.detach().float().cpu())
+                maps_per_batch.append(torch.stack(maps_per_slot, dim=0))
+        return torch.stack(maps_per_batch, dim=0)
+
+    def _prepare_attribute_bank_for_decode(self, attribute_bank, physics_feat_shared, metadata=None, name="attribute_bank"):
+        attribute_bank = self._safe_physical_tensor(attribute_bank, name)
+        if self._uses_only_u_policy():
+            _, attribute_bank, _ = self.build_physical_field_dict(
+                attribute_bank,
+                physics_feat_shared,
+                metadata=metadata,
+                field_recovery_phase=self.field_recovery_phase,
+            )
+        return attribute_bank.to(dtype=physics_feat_shared.dtype)
 
     def set_pde_residuals(self, pde_residuals):
         """设置PDE残差模块（用于约束计算）"""
@@ -1790,10 +2040,35 @@ class PhysicsAdapter(nn.Module):
         self.apply_constraints_in_forward = bool(enabled)
         self.constraint_step_size = max(float(step_size), 0.0)
 
+    def set_export_expert_attention(self, enabled=True, apply_router_weight=True):
+        """Enable/disable per-active-expert spatial correction attribution export."""
+        self.export_expert_attention = bool(enabled)
+        self.expert_attention_apply_router_weight = bool(apply_router_weight)
+
+    def set_core_ablation_mode(self, mode="full"):
+        """Configure coarse mechanism ablations used by isolated experiment runners."""
+        mode = str(mode or "full")
+        if mode not in CORE_ABLATION_MODES:
+            raise ValueError(
+                f"Unsupported core_ablation_mode={mode!r}. "
+                f"Expected one of {CORE_ABLATION_MODES}."
+            )
+        self.core_ablation_mode = mode
+        self.interpret_attribute_bank_as_physical = mode not in {
+            "generic_latent_correction",
+            "wo_explicit_physical_interface",
+        }
+        self.use_phenomenon_specific_operators = mode not in {
+            "generic_latent_correction",
+            "wo_phenomenon_specific_operators",
+        }
+        self.physics_to_flow_injection_enabled = mode != "wo_physics_to_flow_injection"
+        self.force_label_only_routing = mode == "wo_learned_expert_routing"
+
     def set_ablation_modes(self, use_moe=True, label_only_mode=False):
         """设置消融模式开关"""
-        self.use_moe = bool(use_moe)
-        self.label_only_mode = bool(label_only_mode)
+        self.use_moe = bool(use_moe) and self.core_ablation_mode != "generic_latent_correction"
+        self.label_only_mode = bool(label_only_mode) or self.force_label_only_routing
 
     def is_using_shared_fallback(self):
         """
@@ -1824,6 +2099,10 @@ class PhysicsAdapter(nn.Module):
             dict: 包含模式状态的字典
         """
         return {
+            "core_ablation_mode": self.core_ablation_mode,
+            "interpret_attribute_bank_as_physical": self.interpret_attribute_bank_as_physical,
+            "use_phenomenon_specific_operators": self.use_phenomenon_specific_operators,
+            "physics_to_flow_injection_enabled": self.physics_to_flow_injection_enabled,
             "using_shared_fallback": self._cache.get("using_shared_fallback", True),
             "fallback_reason": self._cache.get("fallback_reason", None),
             "use_moe_setting": self.use_moe,

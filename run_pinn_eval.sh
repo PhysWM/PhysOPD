@@ -14,11 +14,14 @@ fi
 export CUDA_VISIBLE_DEVICES=3
 
 # Basic inference with automatic LLM routing labels
-/home/dataset-assist-0/algorithm/cong.wang/miniconda3/envs/wan/bin/python examples/wanvideo/pinn_inference/inference_pinn.py \
-    --prompt "An umbrella catches the drops of the sudden rainwater." \
+/home/dataset-assist-0/algorithm/cong.wang/miniconda3/envs/wan/bin/python examples/wanvideo/pinn_inference/batch_inference_pinn.py \
+    --csv /home/dataset-assist-0/algorithm/cong.wang/DiffSynth-Studio/phygenbench_prompts.csv \
     --checkpoint_path /home/dataset-assist-0/algorithm/cong.wang/DiffSynth-Studio/models/train/wan21_stage2_fullpinn8/step-18500.pt \
     --auto_label_from_prompt \
-    --output video_pinn_umbrella.mp4
+    --output_dir phygenbench_videos_wan22_pinn_batch \
+    --skip_existing \
+    --model_id Wan-AI/Wan2.2-T2V-A14B \
+    --start_id 0 --end_id 200
 
 # Raw n/q metadata inference (recommended if you want to override routing manually)
 # You can pass raw fields directly; script will auto-encode to adapter metadata.

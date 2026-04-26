@@ -35,6 +35,7 @@ SCRIPT_DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../../.." && pwd)"
 ACCELERATE_CONFIG_PATH="${SCRIPT_DIR}/accelerate_config_pinn.yaml"
 TRAIN_SCRIPT_PATH="${SCRIPT_DIR}/train_pinn.py"
+PYTHON_BIN="${PYTHON_BIN:-/home/dataset-assist-0/algorithm/cong.wang/miniconda3/envs/wan/bin/python}"
 
 cd "${REPO_ROOT}"
 export PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
@@ -62,7 +63,8 @@ export NCCL_IB_DISABLE="${NCCL_IB_DISABLE:-1}"
 export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-8.0}"
 export TORCH_DISTRIBUTED_DEBUG="${TORCH_DISTRIBUTED_DEBUG:-OFF}"
 
-if pgrep -af "accelerate launch --config_file ${ACCELERATE_CONFIG_PATH}" >/dev/null; then
+TRAIN_PROCESS_PATTERN="${TRAIN_SCRIPT_PATH/train_pinn.py/[t]rain_pinn.py}"
+if pgrep -af "${TRAIN_PROCESS_PATTERN}" >/dev/null; then
   echo "Detected an existing PINN accelerate job. Stop old processes first to avoid contention."
   exit 1
 fi
@@ -130,6 +132,8 @@ DEBUG_FIXED_TIMESTEP_FRACTION="${DEBUG_FIXED_TIMESTEP_FRACTION:-}"
 SAVE_STEPS="${SAVE_STEPS:-500}"
 MAX_STEPS="${MAX_STEPS:-}"
 EXTRA_FLAGS="${EXTRA_FLAGS:-}"
+CORE_ABLATION_MODE="${CORE_ABLATION_MODE:-full}"
+ALLOW_ABLATION_CHECKPOINT_MISMATCH="${ALLOW_ABLATION_CHECKPOINT_MISMATCH:-0}"
 
 if [[ -z "${OUTPUT_PATH:-}" ]]; then
   if [[ "${TRAINING_STAGE}" == "observable_pretrain" ]]; then
@@ -196,7 +200,7 @@ ACCELERATE_LAUNCH_ARGS=(
 )
 
 TRAIN_CMD=(
-  accelerate launch
+  "${PYTHON_BIN}" -m accelerate.commands.launch
   "${ACCELERATE_LAUNCH_ARGS[@]}"
   "${TRAIN_SCRIPT_PATH}"
   --dataset_base_path "${DATASET_BASE_PATH}"
@@ -248,6 +252,7 @@ TRAIN_CMD=(
   --disable_rl_expert_optimization
   --no_use_dual_noise_experts
   --moe_top_k "${MOE_TOP_K}"
+  --core_ablation_mode "${CORE_ABLATION_MODE}"
   --dataset_num_workers "${DATASET_NUM_WORKERS}"
   --diagnostic_metrics_interval "${DIAGNOSTIC_METRICS_INTERVAL}"
   --heartbeat_log_steps "${HEARTBEAT_LOG_STEPS}"
@@ -275,6 +280,10 @@ if [[ "${FREEZE_U_ENCODER_DURING_RECOVERY}" == "0" ]]; then
   TRAIN_CMD+=(--no_freeze_u_encoder_during_recovery)
 else
   TRAIN_CMD+=(--freeze_u_encoder_during_recovery)
+fi
+
+if [[ "${ALLOW_ABLATION_CHECKPOINT_MISMATCH}" == "1" ]]; then
+  TRAIN_CMD+=(--allow_ablation_checkpoint_mismatch)
 fi
 
 if [[ -n "${MAX_STEPS}" ]]; then
@@ -312,6 +321,8 @@ echo "  secondary field strategy : ${SECONDARY_FIELD_STRATEGY}"
 echo "  field recovery phase     : ${FIELD_RECOVERY_PHASE}"
 echo "  run full pinn after rec. : ${RUN_FULL_PINN_AFTER_RECOVERY}"
 echo "  freeze u during recovery : ${FREEZE_U_ENCODER_DURING_RECOVERY}"
+echo "  core ablation mode       : ${CORE_ABLATION_MODE}"
+echo "  allow ablation mismatch  : ${ALLOW_ABLATION_CHECKPOINT_MISMATCH}"
 echo "  debug overfit samples    : ${DEBUG_OVERFIT_NUM_SAMPLES:-<none>}"
 echo "  debug overfit repeat     : ${DEBUG_OVERFIT_DATASET_REPEAT:-<none>}"
 echo "  debug fixed timestep     : ${DEBUG_FIXED_TIMESTEP_FRACTION:-<none>}"

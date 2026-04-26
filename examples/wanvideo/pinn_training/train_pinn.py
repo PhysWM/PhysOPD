@@ -27,7 +27,11 @@ import math
 from diffsynth import load_state_dict
 from diffsynth.pipelines.wan_video_new import WanVideoPipeline, ModelConfig
 from diffsynth.models.pinn_operators import MaterialPDEResiduals, MaterialClassifier
-from diffsynth.models.pinn_adapter import PhysicsAdapter, ONLY_U_RECOVERY_PHASES
+from diffsynth.models.pinn_adapter import (
+    CORE_ABLATION_MODES,
+    PhysicsAdapter,
+    ONLY_U_RECOVERY_PHASES,
+)
 from diffsynth.models.pinn_contracts import (
     EXPERT_FIELD_RECIPE_VERSION,
     EXPERT_FIELD_RECIPES,
@@ -397,6 +401,8 @@ class WanPINNTrainingModule(DiffusionTrainingModule):
         ablate_disable_conditioned_pde=False,
         ablate_disable_aux_losses=False,
         ablate_label_only_router=False,
+        core_ablation_mode="full",
+        allow_ablation_checkpoint_mismatch=False,
         diagnostic_metrics_interval=10,
         motion_mask_floor=0.08,
         motion_mask_quantile=0.9,
@@ -506,6 +512,7 @@ class WanPINNTrainingModule(DiffusionTrainingModule):
             rl_hidden_dim=adapter_hidden_dim if rl_hidden_dim is None else rl_hidden_dim,
             rl_reward_decay=rl_reward_decay,
             strict_physical_state_contract=True,
+            core_ablation_mode=core_ablation_mode,
         )
         self.physics_adapter.train()
         self.physics_adapter.requires_grad_(True)
@@ -567,6 +574,8 @@ class WanPINNTrainingModule(DiffusionTrainingModule):
             ablate_disable_conditioned_pde=ablate_disable_conditioned_pde,
             ablate_disable_aux_losses=ablate_disable_aux_losses,
             ablate_label_only_router=ablate_label_only_router,
+            core_ablation_mode=core_ablation_mode,
+            allow_ablation_checkpoint_mismatch=allow_ablation_checkpoint_mismatch,
             diagnostic_metrics_interval=diagnostic_metrics_interval,
             motion_mask_floor=motion_mask_floor,
             motion_mask_quantile=motion_mask_quantile,
@@ -647,9 +656,11 @@ class WanPINNTrainingModule(DiffusionTrainingModule):
                 self.pde_residuals.eval()
                 self.pde_residuals.requires_grad_(False)
             # 加载训练状态（如果有）
-            if 'training_state' in checkpoint:
+            if 'training_state' in checkpoint and not self.allow_ablation_checkpoint_mismatch:
                 self._checkpoint_training_state = checkpoint['training_state']
                 print(f"Found training state in checkpoint: step={self._checkpoint_training_state.get('current_step', 0)}, epoch={self._checkpoint_training_state.get('current_epoch', 0)}")
+            elif 'training_state' in checkpoint:
+                print("Ignoring checkpoint training_state for ablation warm-start.")
             if checkpoint_config.get("training_stage") in {"observable_pretrain", "encoder_completion"}:
                 self.observable_diagnostics_enabled = True
             encoder_stage_state_dict = checkpoint.get("encoder_stage_state_dict")
@@ -715,13 +726,28 @@ class WanPINNTrainingModule(DiffusionTrainingModule):
 
         # 将消融配置同步到底层模块，保持调用层逻辑清晰
         self.physics_adapter.set_ablation_modes(
-            use_moe=not self.ablate_disable_moe,
-            label_only_mode=self.ablate_label_only_router,
+            use_moe=(
+                not self.ablate_disable_moe
+                and self.core_ablation_mode != "generic_latent_correction"
+            ),
+            label_only_mode=(
+                self.ablate_label_only_router
+                or self.core_ablation_mode == "wo_learned_expert_routing"
+            ),
         )
         self.pde_residuals.set_conditioning_enabled(
-            enabled=not self.ablate_disable_conditioned_pde
+            enabled=(
+                not self.ablate_disable_conditioned_pde
+                and self.core_ablation_mode not in {
+                    "generic_latent_correction",
+                    "wo_explicit_physical_interface",
+                    "wo_pde_residuals",
+                }
+            )
         )
         print("Ablation flags:")
+        print(f"  core_ablation_mode={self.core_ablation_mode}")
+        print(f"  allow_ablation_checkpoint_mismatch={self.allow_ablation_checkpoint_mismatch}")
         print(f"  disable_moe={self.ablate_disable_moe}")
         print(f"  disable_conditioned_pde={self.ablate_disable_conditioned_pde}")
         print(f"  disable_aux_losses={self.ablate_disable_aux_losses}")
@@ -1146,6 +1172,8 @@ class WanPINNTrainingModule(DiffusionTrainingModule):
         ablate_disable_conditioned_pde,
         ablate_disable_aux_losses,
         ablate_label_only_router,
+        core_ablation_mode,
+        allow_ablation_checkpoint_mismatch,
         diagnostic_metrics_interval,
         motion_mask_floor,
         motion_mask_quantile,
@@ -1227,6 +1255,14 @@ class WanPINNTrainingModule(DiffusionTrainingModule):
         self.ablate_disable_conditioned_pde = ablate_disable_conditioned_pde
         self.ablate_disable_aux_losses = ablate_disable_aux_losses
         self.ablate_label_only_router = ablate_label_only_router
+        self.core_ablation_mode = str(core_ablation_mode or "full")
+        if self.core_ablation_mode not in CORE_ABLATION_MODES:
+            raise ValueError(
+                f"Unsupported core_ablation_mode={self.core_ablation_mode!r}; "
+                f"expected one of {CORE_ABLATION_MODES}."
+            )
+        self.allow_ablation_checkpoint_mismatch = bool(allow_ablation_checkpoint_mismatch)
+        self.physics_adapter.set_core_ablation_mode(self.core_ablation_mode)
         self.diagnostic_metrics_interval = max(int(diagnostic_metrics_interval), 1)
         self.motion_mask_floor = min(max(float(motion_mask_floor), 0.0), 0.5)
         self.motion_mask_quantile = min(max(float(motion_mask_quantile), 0.5), 0.995)
@@ -1531,6 +1567,24 @@ class WanPINNTrainingModule(DiffusionTrainingModule):
             else:
                 if expected_value != current_value:
                     mismatches.append((key, expected_value, current_value))
+        if mismatches:
+            if getattr(self, "allow_ablation_checkpoint_mismatch", False):
+                ablation_relaxed_keys = {
+                    "physics_weight_target",
+                    "output_physics_weight",
+                    "state_align_x_weight",
+                    "state_align_v_weight",
+                    "state_align_v_weight_target",
+                    "decoded_branch_consistency_weight",
+                    "expert_pde_sigma_threshold",
+                    "expert_pde_sigma_threshold_target",
+                    "encoder_freeze_steps",
+                    "encoder_lr_scale",
+                }
+                mismatches = [
+                    mismatch for mismatch in mismatches
+                    if mismatch[0] not in ablation_relaxed_keys
+                ]
         if mismatches:
             details = ", ".join(
                 f"{key}: checkpoint={expected} current={current}"
@@ -4063,11 +4117,33 @@ class WanPINNTrainingModule(DiffusionTrainingModule):
             physics_state_original.detach(),
         )
 
-        physical_mask, physical_mask_info = self._build_active_physical_mask(
-            fused_attribute_bank,
-            metadata=metadata,
-            cache=cache,
+        zero_loss = torch.zeros((), device=v_corrected.device, dtype=v_corrected.dtype)
+        explicit_physical_interface = bool(
+            getattr(self.physics_adapter, "interpret_attribute_bank_as_physical", True)
         )
+        if explicit_physical_interface:
+            physical_mask, physical_mask_info = self._build_active_physical_mask(
+                fused_attribute_bank,
+                metadata=metadata,
+                cache=cache,
+            )
+        else:
+            physical_mask = torch.clamp(
+                bootstrap_motion_mask.detach(),
+                self.motion_mask_floor,
+                1.0,
+            )
+            physical_mask_info = {
+                "active_phenomena": [[] for _ in range(v_original.shape[0])],
+                "active_fields": [[] for _ in range(v_original.shape[0])],
+                "active_field_count": torch.zeros(
+                    v_original.shape[0],
+                    device=v_original.device,
+                    dtype=v_original.dtype,
+                ),
+                "source": f"{self.core_ablation_mode}_bootstrap_motion_mask",
+                "recipe_version": "no_explicit_physical_interface",
+            }
         effective_motion_mask, physical_mask_blend_alpha = self._blend_motion_masks(
             bootstrap_motion_mask.detach(),
             physical_mask.detach(),
@@ -4122,21 +4198,39 @@ class WanPINNTrainingModule(DiffusionTrainingModule):
         if active_noise_regime != "single":
             motion_mask_metrics[f"noise_regime_{active_noise_regime}"] = 1.0
 
-        loss_physics_shared, physics_info = self.compute_targeted_expert_physics_loss(
-            shared_attribute_bank,
-            sigma=sigma,
-            metadata=pde_metadata,
-        )
+        pde_disabled_by_core_mode = self.core_ablation_mode in {
+            "generic_latent_correction",
+            "wo_explicit_physical_interface",
+            "wo_pde_residuals",
+        }
+        pde_disabled_by_weight = float(physics_weight) <= 0.0
+        if pde_disabled_by_core_mode or pde_disabled_by_weight:
+            loss_physics_shared = zero_loss
+            physics_info = {
+                "physics_mode": f"{self.core_ablation_mode}_pde_disabled",
+                "physics_stage": "disabled",
+                "pde_disabled_by_core_mode": float(pde_disabled_by_core_mode),
+                "pde_disabled_by_weight": float(pde_disabled_by_weight),
+                "active_label_count": float(len(self._resolve_active_label_names(metadata))),
+            }
+        else:
+            loss_physics_shared, physics_info = self.compute_targeted_expert_physics_loss(
+                shared_attribute_bank,
+                sigma=sigma,
+                metadata=pde_metadata,
+            )
         physics_info = {
             **physics_info,
             "physics_mode": (
+                str(physics_info.get("physics_mode"))
+                if pde_disabled_by_core_mode or pde_disabled_by_weight
+                else
                 "only_u_physical_fields_expert"
                 if self.ablation_preset.startswith("u_only_")
                 else "explicit_attribute_bank_v2_expert"
             ),
         }
         loss_physics = loss_physics_shared
-        zero_loss = torch.zeros((), device=v_corrected.device, dtype=v_corrected.dtype)
         loss_physics_value = float(loss_physics.detach().item())
 
         parse_ratio = 1.0
@@ -4228,6 +4322,14 @@ class WanPINNTrainingModule(DiffusionTrainingModule):
         only_u_metrics = self._collect_only_u_metrics(cache, physics_info=physics_info)
         self._last_metrics = {
             "phenomenon": phenomenon,
+            "core_ablation_mode": self.core_ablation_mode,
+            "explicit_physical_interface": float(explicit_physical_interface),
+            "physics_to_flow_injection_enabled": float(
+                getattr(self.physics_adapter, "physics_to_flow_injection_enabled", True)
+            ),
+            "phenomenon_specific_operators": float(
+                getattr(self.physics_adapter, "use_phenomenon_specific_operators", True)
+            ),
             "ablation_preset": self.ablation_preset,
             "observable_target_mode": self.observable_target_mode,
             "secondary_field_strategy": self.secondary_field_strategy,
@@ -4944,6 +5046,10 @@ class PINNModelLogger(ModelLogger):
                 'config': {
                     'checkpoint_format_version': 19,
                     'adapter_architecture': 'explicit_attribute_bank_v2',
+                    'core_ablation_mode': (
+                        unwrapped_model.core_ablation_mode
+                        if hasattr(unwrapped_model, 'core_ablation_mode') else "full"
+                    ),
                     'field_contract_version': FIELD_CONTRACT_VERSION,
                     'expert_field_recipe_version': EXPERT_FIELD_RECIPE_VERSION,
                     'observable_proxy_recipe_version': OBSERVABLE_PROXY_RECIPE_VERSION,
@@ -5183,6 +5289,10 @@ class PINNModelLogger(ModelLogger):
                         if hasattr(unwrapped_model, 'explainability_top_experts') else 6
                     ),
                     'ablation_flags': {
+                        'core_ablation_mode': (
+                            unwrapped_model.core_ablation_mode
+                            if hasattr(unwrapped_model, 'core_ablation_mode') else "full"
+                        ),
                         'ablate_disable_moe': (
                             unwrapped_model.ablate_disable_moe
                             if hasattr(unwrapped_model, 'ablate_disable_moe') else False
@@ -5392,6 +5502,15 @@ def pinn_parser():
     parser.add_argument(
         "--ablate_label_only_router", action="store_true",
         help="Ablation: only keep label routing, mask n/q conditional inputs"
+    )
+    parser.add_argument(
+        "--core_ablation_mode", type=str, default="full",
+        choices=list(CORE_ABLATION_MODES),
+        help="Coarse PhysFM mechanism ablation mode used by isolated core-ablation runners."
+    )
+    parser.add_argument(
+        "--allow_ablation_checkpoint_mismatch", action="store_true",
+        help="Allow selected runtime-config mismatches when warm-starting an ablation from a full checkpoint."
     )
     parser.add_argument(
         "--frozen_model_gradient_checkpointing", action="store_true",
@@ -5652,6 +5771,8 @@ if __name__ == "__main__":
         ablate_disable_conditioned_pde=args.ablate_disable_conditioned_pde,
         ablate_disable_aux_losses=args.ablate_disable_aux_losses,
         ablate_label_only_router=args.ablate_label_only_router,
+        core_ablation_mode=args.core_ablation_mode,
+        allow_ablation_checkpoint_mismatch=args.allow_ablation_checkpoint_mismatch,
         diagnostic_metrics_interval=args.diagnostic_metrics_interval,
         motion_mask_floor=args.motion_mask_floor,
         motion_mask_quantile=args.motion_mask_quantile,

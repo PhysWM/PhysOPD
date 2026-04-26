@@ -3,14 +3,14 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CSV_PATH="$SCRIPT_DIR/videophy_test_public.csv"
-OUTPUT_DIR="$SCRIPT_DIR/video_hunyuan"
+CSV_PATH="/home/dataset-assist-0/algorithm/cong.wang/DiffSynth-Studio/phygenbench_prompts.csv"
+OUTPUT_DIR="$SCRIPT_DIR/phygenbench_hunyuan"
 
 export HF_HOME="/home/dataset-assist-0/algorithm/cong.wang/cache"
 export TORCH_HOME="/home/dataset-assist-0/algorithm/cong.wang/cache/torch"
 export XDG_CACHE_HOME="/home/dataset-assist-0/algorithm/cong.wang/cache/xdg_cache"
 export HF_ENDPOINT="https://hf-mirror.com"
-export CUDA_VISIBLE_DEVICES=1
+export CUDA_VISIBLE_DEVICES=3
 
 mkdir -p "$OUTPUT_DIR"
 

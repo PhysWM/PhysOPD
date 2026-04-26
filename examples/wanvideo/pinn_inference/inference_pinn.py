@@ -279,6 +279,10 @@ def inference_pinn(
     attention_alpha=0.45,
     attention_use_motion_weighted=True,
     attention_motion_percentile=90.0,
+    export_expert_attention=False,
+    expert_attention_topk=4,
+    expert_attention_num_frames=2,
+    expert_attention_apply_router_weight=True,
     observable_inspection_only=False,
     metadata_json=None,
     metadata_csv=None,
@@ -320,6 +324,8 @@ def inference_pinn(
             device=device,
             enable_tracking=True,
             observable_inspection_only=observable_inspection_only,
+            export_expert_attention=export_expert_attention,
+            expert_attention_apply_router_weight=expert_attention_apply_router_weight,
         )
         if observable_inspection_only:
             print("PINN observable inspection active: Wan denoising runs normally, encoder diagnostics are recorded without applying adapter correction")
@@ -438,6 +444,11 @@ def inference_pinn(
             attention_video_fps=fps,
             attention_use_motion_weighted=attention_use_motion_weighted,
             attention_motion_percentile=attention_motion_percentile,
+            export_expert_attention=export_expert_attention,
+            expert_attention_topk=expert_attention_topk,
+            expert_attention_num_frames=expert_attention_num_frames,
+            expert_attention_prompt=effective_prompt,
+            expert_attention_apply_router_weight=expert_attention_apply_router_weight,
         )
         if observable_inspection_only:
             pipe.save_observable_report(
@@ -502,6 +513,28 @@ if __name__ == "__main__":
         help="Percentile threshold for the auxiliary motion-weighted correction view (default: 90)",
     )
     parser.add_argument(
+        "--export_expert_attention",
+        action="store_true",
+        help="Export per-active-expert spatial correction attribution into trace NPZ and PNG/PDF grid.",
+    )
+    parser.add_argument(
+        "--expert_attention_topk",
+        type=int,
+        default=4,
+        help="Maximum active experts to show in the expert attention grid.",
+    )
+    parser.add_argument(
+        "--expert_attention_num_frames",
+        type=int,
+        default=2,
+        help="Number of evenly sampled frames to show in the expert attention grid.",
+    )
+    parser.add_argument(
+        "--expert_attention_unweighted",
+        action="store_true",
+        help="Visualize each active expert's raw correction response without multiplying by its router weight.",
+    )
+    parser.add_argument(
         "--observable_inspection_only",
         action="store_true",
         help="Run full Wan inference but only record encoder observable diagnostics; do not apply adapter correction to v_original.",
@@ -549,6 +582,10 @@ if __name__ == "__main__":
         attention_alpha=args.attention_alpha,
         attention_use_motion_weighted=not args.disable_motion_weighted_attention,
         attention_motion_percentile=args.attention_motion_percentile,
+        export_expert_attention=args.export_expert_attention,
+        expert_attention_topk=args.expert_attention_topk,
+        expert_attention_num_frames=args.expert_attention_num_frames,
+        expert_attention_apply_router_weight=not args.expert_attention_unweighted,
         observable_inspection_only=args.observable_inspection_only,
         metadata_json=args.metadata_json,
         metadata_csv=args.metadata_csv,

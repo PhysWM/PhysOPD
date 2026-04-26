@@ -620,7 +620,17 @@ class PhysicsInformedWanVideoPipeline(WanVideoPipeline):
         else:
             raise RuntimeError(f"Unsupported material_type for explicit physics loss: {material_type!r}")
     
-    def load_pinn_plugin(self, checkpoint_path, device=None, enable_tracking=True, observable_inspection_only=False):
+    def load_pinn_plugin(
+        self,
+        checkpoint_path,
+        device=None,
+        enable_tracking=True,
+        observable_inspection_only=False,
+        export_expert_attention=False,
+        expert_attention_apply_router_weight=True,
+        moe_top_k_override=None,
+        excluded_expert_names=None,
+    ):
         """
         加载 PINN 插件并将 adapter 接入推理流程。
         每个去噪步骤都会实时计算 PDE 残差（散度/涡量），记录到 self.physics_tracking。
@@ -630,6 +640,10 @@ class PhysicsInformedWanVideoPipeline(WanVideoPipeline):
             device: 设备（默认用 pipeline 的 device）
             enable_tracking: 是否在推理时追踪物理场指标（默认开启）
             observable_inspection_only: 仅使用 stage1 observable encoder 做诊断，不对 Wan 速度场施加校正
+            export_expert_attention: 导出 active MoE experts 的空间 correction contribution
+            expert_attention_apply_router_weight: 是否用 router weight 缩放每个 expert contribution
+            moe_top_k_override: 覆盖 checkpoint 中保存的 MoE active expert count；允许为 0
+            excluded_expert_names: 运行时从路由和 label prior 中排除的专家名称列表
         """
         if device is None:
             device = self.device
@@ -666,6 +680,7 @@ class PhysicsInformedWanVideoPipeline(WanVideoPipeline):
                 f"expected {EXPERT_FIELD_RECIPE_VERSION!r}, got {expert_field_recipe_version!r}."
             )
         self.physics_state_mode = config.get("physics_state_mode", self.physics_state_mode)
+        self.core_ablation_mode = str(config.get("core_ablation_mode", "full") or "full")
         self.use_sigma_gate = bool(config.get("use_sigma_gate", self.use_sigma_gate))
         self.sigma_gate_curve = config.get("sigma_gate_curve", self.sigma_gate_curve)
         default_sigma_conditioning = self.use_sigma_conditioning
@@ -688,6 +703,8 @@ class PhysicsInformedWanVideoPipeline(WanVideoPipeline):
             config.get("expert_pde_sigma_threshold", self.expert_pde_sigma_threshold)
         )
         self.moe_top_k = int(config.get("moe_top_k", self.moe_top_k))
+        if moe_top_k_override is not None:
+            self.moe_top_k = max(0, min(int(moe_top_k_override), self.num_phenomena))
         self.use_sigma_conditioning = bool(
             config.get("use_sigma_conditioning", default_sigma_conditioning)
         )
@@ -739,6 +756,8 @@ class PhysicsInformedWanVideoPipeline(WanVideoPipeline):
                 rl_hidden_dim=self.rl_hidden_dim,
                 rl_reward_decay=self.rl_reward_decay,
                 strict_physical_state_contract=True,
+                excluded_expert_names=excluded_expert_names,
+                core_ablation_mode=self.core_ablation_mode,
             )
             load_result = self.physics_adapter.load_state_dict(
                 checkpoint['physics_adapter_state_dict'],
@@ -787,15 +806,40 @@ class PhysicsInformedWanVideoPipeline(WanVideoPipeline):
                     self.physics_adapter.rl_reward_ema.zero_()
                 print("  Initialized missing buffer: rl_reward_ema")
             self.physics_adapter.physics_state_mode = self.physics_state_mode
+            self.physics_adapter.set_core_ablation_mode(self.core_ablation_mode)
             self.physics_adapter.use_sigma_gate = self.use_sigma_gate
             self.physics_adapter.sigma_gate_curve = self.sigma_gate_curve
             self.physics_adapter.use_sigma_conditioning = self.use_sigma_conditioning
             self.physics_adapter.sigma_conditioning_dim = self.sigma_conditioning_dim
             self.physics_adapter.sigma_gate_floor = self.sigma_gate_floor
             self.physics_adapter.strict_physical_state_contract = True
+            self.physics_adapter.moe_top_k = max(0, min(int(self.moe_top_k), self.physics_adapter.num_phenomena))
+            ablation_flags = config.get("ablation_flags", {})
+            if not isinstance(ablation_flags, dict):
+                ablation_flags = {}
+            self.physics_adapter.set_ablation_modes(
+                use_moe=(
+                    not bool(ablation_flags.get("ablate_disable_moe", False))
+                    and self.core_ablation_mode != "generic_latent_correction"
+                ),
+                label_only_mode=(
+                    bool(ablation_flags.get("ablate_label_only_router", False))
+                    or self.core_ablation_mode == "wo_learned_expert_routing"
+                ),
+            )
+            self.physics_adapter.set_excluded_experts(excluded_expert_names)
+            self.physics_adapter.set_export_expert_attention(
+                export_expert_attention,
+                apply_router_weight=expert_attention_apply_router_weight,
+            )
             self.physics_adapter.to(dtype=self.torch_dtype, device=device)
             self.physics_adapter.eval()
-            print(f"  PhysicsAdapter loaded (dtype={self.torch_dtype})")
+            print(
+                f"  PhysicsAdapter loaded (dtype={self.torch_dtype}, "
+                f"moe_top_k={self.physics_adapter.moe_top_k}, "
+                f"core_ablation_mode={self.core_ablation_mode}, "
+                f"excluded_experts={self.physics_adapter.excluded_expert_names})"
+            )
         
         if 'pde_residuals_state_dict' in checkpoint:
             self.pde_residuals = MaterialPDEResiduals(
@@ -1119,6 +1163,11 @@ class PhysicsInformedWanVideoPipeline(WanVideoPipeline):
         attention_video_fps: int = 15,
         attention_use_motion_weighted: bool = True,
         attention_motion_percentile: float = 90.0,
+        export_expert_attention: bool = False,
+        expert_attention_topk: int = 4,
+        expert_attention_num_frames: int = 2,
+        expert_attention_prompt: str = "",
+        expert_attention_apply_router_weight: bool = True,
     ):
         """
         推理完成后调用，生成物理场验证报告。
@@ -1146,6 +1195,8 @@ class PhysicsInformedWanVideoPipeline(WanVideoPipeline):
         correction_overlay_alias = f"{base}_attention_overlay.png"
         correction_overlay_video_path = f"{base}_correction_attribution_overlay.mp4"
         correction_overlay_video_alias = f"{base}_attention_overlay.mp4"
+        expert_attention_png_path = f"{base}_expert_attention_grid.png"
+        expert_attention_pdf_path = f"{base}_expert_attention_grid.pdf"
         trace_path = f"{base}_physics_trace.npz"
         
         # ═══════════ 图1: 标量曲线（latent 空间指标） ═══════════
@@ -1199,15 +1250,51 @@ class PhysicsInformedWanVideoPipeline(WanVideoPipeline):
                             correction_overlay_video_path,
                             correction_overlay_video_alias,
                         )
-                if correction_attribution_maps is not None or motion_weighted_maps is not None:
+                expert_attribution_maps = None
+                expert_ids = None
+                expert_names = None
+                expert_weights = None
+                if export_expert_attention:
+                    (
+                        expert_attribution_maps,
+                        expert_ids,
+                        expert_names,
+                        expert_weights,
+                    ) = self._build_expert_attention_maps_for_video(
+                        snapshots=snapshots,
+                        n_frames=len(video_frames),
+                        frame_height=video_frames[0].height,
+                        frame_width=video_frames[0].width,
+                        topk=expert_attention_topk,
+                    )
+                    if expert_attribution_maps is not None:
+                        self._plot_expert_attention_grid(
+                            video_frames=video_frames,
+                            expert_maps=expert_attribution_maps,
+                            expert_names=expert_names,
+                            prompt=expert_attention_prompt,
+                            png_path=expert_attention_png_path,
+                            pdf_path=expert_attention_pdf_path,
+                            num_frames=expert_attention_num_frames,
+                        )
+                if (
+                    correction_attribution_maps is not None
+                    or motion_weighted_maps is not None
+                    or expert_attribution_maps is not None
+                ):
                     trace_cause = correction_attribution_maps
                     if trace_cause is None:
-                        trace_cause = np.zeros_like(motion_weighted_maps, dtype=np.float32)
+                        if motion_weighted_maps is not None:
+                            trace_cause = np.zeros_like(motion_weighted_maps, dtype=np.float32)
+                        elif expert_attribution_maps is not None:
+                            trace_cause = np.zeros(
+                                expert_attribution_maps.shape[1:],
+                                dtype=np.float32,
+                            )
                     trace_motion = motion_weighted_maps
                     if trace_motion is None:
                         trace_motion = np.zeros_like(trace_cause, dtype=np.float32)
-                    np.savez_compressed(
-                        trace_path,
+                    trace_payload = dict(
                         correction_attribution_video=np.asarray(trace_cause, dtype=np.float32),
                         motion_weighted_correction_video=np.asarray(trace_motion, dtype=np.float32),
                         raw_correction_norm_per_step=np.asarray(
@@ -1228,6 +1315,21 @@ class PhysicsInformedWanVideoPipeline(WanVideoPipeline):
                         ),
                         step_indices=np.asarray(t.get("steps", []), dtype=np.int32),
                     )
+                    if expert_attribution_maps is not None:
+                        trace_payload.update(
+                            expert_attribution_video=np.asarray(
+                                expert_attribution_maps,
+                                dtype=np.float32,
+                            ),
+                            expert_ids=np.asarray(expert_ids, dtype=np.int32),
+                            expert_names=np.asarray(expert_names, dtype=str),
+                            expert_weights=np.asarray(expert_weights, dtype=np.float32),
+                            expert_attribution_weighted=np.asarray(
+                                bool(expert_attention_apply_router_weight),
+                                dtype=np.bool_,
+                            ),
+                        )
+                    np.savez_compressed(trace_path, **trace_payload)
                     print(f"  [Report] Physics trace NPZ -> {trace_path}")
 
         # ═══════════ 图3: 通道分析 ═══════════
@@ -1404,6 +1506,205 @@ class PhysicsInformedWanVideoPipeline(WanVideoPipeline):
         # 仅保留高响应区域，避免整屏雾化；这是幅值筛选，不改变空间对应关系。
         attention_video = PhysicsInformedWanVideoPipeline._sparsify_attention_maps(attention_video)
         return attention_video
+
+    @staticmethod
+    def _build_expert_attention_maps_for_video(
+        snapshots: list,
+        n_frames: int,
+        frame_height: int,
+        frame_width: int,
+        topk: int = 4,
+        percentile: float = 99.0,
+    ):
+        """Project active expert correction contribution maps to video resolution."""
+        import numpy as np
+
+        if not snapshots or n_frames <= 0 or frame_height <= 0 or frame_width <= 0:
+            return None, None, None, None
+
+        by_expert = {}
+        weights_by_expert = {}
+        names_by_expert = {}
+        for snap in snapshots:
+            maps = snap.get("expert_correction_maps")
+            ids = snap.get("expert_ids")
+            weights = snap.get("expert_weights")
+            names = snap.get("expert_names")
+            if maps is None or ids is None or weights is None:
+                continue
+            maps = np.asarray(maps, dtype=np.float32)
+            ids = np.asarray(ids, dtype=np.int32).reshape(-1)
+            weights = np.asarray(weights, dtype=np.float32).reshape(-1)
+            if maps.ndim != 4 or ids.shape[0] != maps.shape[0] or weights.shape[0] != maps.shape[0]:
+                continue
+            step = max(float(snap.get("step", 1.0)), 1.0)
+            for slot_idx, expert_id in enumerate(ids):
+                expert_id = int(expert_id)
+                by_expert.setdefault(expert_id, []).append((step, maps[slot_idx]))
+                weights_by_expert.setdefault(expert_id, []).append(float(weights[slot_idx]))
+                if names is not None and slot_idx < len(names):
+                    names_by_expert[expert_id] = str(names[slot_idx])
+
+        if not by_expert:
+            print("  [Report] No per-expert correction maps found (skip expert attention grid).")
+            return None, None, None, None
+
+        ranked = sorted(
+            by_expert.keys(),
+            key=lambda expert_id: float(np.mean(weights_by_expert.get(expert_id, [0.0]))),
+            reverse=True,
+        )
+        selected_ids = ranked[: max(1, int(topk))]
+
+        expert_videos = []
+        selected_weights = []
+        selected_names = []
+        for expert_id in selected_ids:
+            entries = by_expert[expert_id]
+            volumes = [np.asarray(volume, dtype=np.float32) for _, volume in entries]
+            steps = np.asarray([step for step, _ in entries], dtype=np.float32)
+            steps = np.maximum(steps, 1.0)
+            step_weights = (steps / (steps.max() + 1e-8)) ** 2
+            step_weights = step_weights / (step_weights.sum() + 1e-8)
+            latent = (np.stack(volumes, axis=0) * step_weights[:, None, None, None]).sum(axis=0)
+            latent = PhysicsInformedWanVideoPipeline._smooth_attention_volume(latent)
+            tensor = torch.from_numpy(latent).unsqueeze(0).unsqueeze(0)
+            video = F.interpolate(
+                tensor,
+                size=(n_frames, frame_height, frame_width),
+                mode="trilinear",
+                align_corners=False,
+            )[0, 0].cpu().numpy().astype(np.float32)
+            expert_videos.append(video)
+            selected_weights.append(float(np.mean(weights_by_expert.get(expert_id, [0.0]))))
+            fallback_name = (
+                PHENOMENON_LABELS[expert_id]
+                if 0 <= expert_id < len(PHENOMENON_LABELS)
+                else f"Expert {expert_id}"
+            )
+            selected_names.append(names_by_expert.get(expert_id, fallback_name))
+
+        expert_video = np.stack(expert_videos, axis=0)
+        denom = np.percentile(expert_video, percentile) + 1e-8
+        expert_video = np.clip(expert_video / denom, 0.0, 1.0).astype(np.float32)
+        return (
+            expert_video,
+            np.asarray(selected_ids, dtype=np.int32),
+            np.asarray(selected_names, dtype=str),
+            np.asarray(selected_weights, dtype=np.float32),
+        )
+
+    @staticmethod
+    def _plot_expert_attention_grid(
+        video_frames: list,
+        expert_maps,
+        expert_names,
+        prompt: str,
+        png_path: str,
+        pdf_path: str,
+        num_frames: int = 2,
+    ):
+        """Paper-style grid: prompt, sampled video frames, and per-expert heatmaps."""
+        import textwrap
+        import matplotlib.pyplot as plt
+        import numpy as np
+
+        if expert_maps is None or len(video_frames) == 0:
+            return
+        expert_maps = np.asarray(expert_maps, dtype=np.float32)
+        if expert_maps.ndim != 4 or expert_maps.shape[0] == 0:
+            return
+
+        n_experts = expert_maps.shape[0]
+        n_total = min(len(video_frames), expert_maps.shape[1])
+        n_rows = min(max(1, int(num_frames)), n_total)
+        indices = np.linspace(0, n_total - 1, n_rows, dtype=int)
+        names = [str(name) for name in np.asarray(expert_names).reshape(-1)]
+        while len(names) < n_experts:
+            names.append(f"Expert {len(names)}")
+
+        sample_frame = np.asarray(video_frames[indices[0]])
+        frame_h, frame_w = sample_frame.shape[:2]
+        aspect = frame_h / max(float(frame_w), 1.0)
+        cell_w = 1.95
+        cell_h = cell_w * aspect
+        prompt_w = 1.55 if n_experts <= 4 else 1.75
+        title_pad = 0.22
+        fig_w = prompt_w + cell_w * (n_experts + 1)
+        fig_h = title_pad + cell_h * n_rows
+        fig = plt.figure(figsize=(fig_w, fig_h), facecolor="white")
+        grid = fig.add_gridspec(
+            n_rows,
+            n_experts + 2,
+            width_ratios=[prompt_w] + [cell_w] * (n_experts + 1),
+            left=0.015,
+            right=0.995,
+            top=0.88,
+            bottom=0.03,
+            wspace=0.015,
+            hspace=0.018,
+        )
+
+        prompt_ax = fig.add_subplot(grid[:, 0])
+        prompt_ax.axis("off")
+        prompt_clean = " ".join(str(prompt or "").split())
+        prompt_words = prompt_clean.split()
+        if len(prompt_words) > 24:
+            prompt_clean = " ".join(prompt_words[:24]) + "..."
+        prompt_text = textwrap.fill(prompt_clean, width=23)
+        prompt_ax.text(
+            0.96,
+            0.5,
+            prompt_text,
+            ha="right",
+            va="center",
+            fontsize=9.0,
+            fontweight="normal",
+            family="serif",
+            linespacing=1.18,
+        )
+
+        spine_color = "white"
+        spine_width = 1.4
+        for row, frame_idx in enumerate(indices):
+            frame_ax = fig.add_subplot(grid[row, 1])
+            frame_ax.imshow(np.asarray(video_frames[frame_idx]))
+            frame_ax.set_xticks([])
+            frame_ax.set_yticks([])
+            if row == 0:
+                frame_ax.set_title("Video", fontsize=10.5, fontweight="bold", family="serif", pad=5)
+            for spine in frame_ax.spines.values():
+                spine.set_color(spine_color)
+                spine.set_linewidth(spine_width)
+
+            for expert_idx in range(n_experts):
+                ax = fig.add_subplot(grid[row, expert_idx + 2])
+                ax.imshow(
+                    expert_maps[expert_idx, frame_idx],
+                    cmap="coolwarm",
+                    vmin=0.0,
+                    vmax=1.0,
+                    interpolation="bilinear",
+                )
+                ax.set_xticks([])
+                ax.set_yticks([])
+                if row == 0:
+                    ax.set_title(
+                        names[expert_idx],
+                        fontsize=10.5,
+                        fontweight="bold",
+                        family="serif",
+                        pad=5,
+                    )
+                for spine in ax.spines.values():
+                    spine.set_color(spine_color)
+                    spine.set_linewidth(spine_width)
+
+        plt.savefig(png_path, dpi=260, bbox_inches="tight", pad_inches=0.015)
+        plt.savefig(pdf_path, bbox_inches="tight", pad_inches=0.015)
+        plt.close(fig)
+        print(f"  [Report] Expert attention grid -> {png_path}")
+        print(f"  [Report] Expert attention grid PDF -> {pdf_path}")
     
     @staticmethod
     def _smooth_attention_volume(volume, spatial_kernel: int = 5, temporal_kernel: int = 3):
@@ -1812,6 +2113,8 @@ class PhysicsInformedWanVideoPipeline(WanVideoPipeline):
         rl_hidden_dim=None,
         rl_reward_decay=0.95,
         strict_physical_state_contract=True,
+        excluded_expert_names=None,
+        core_ablation_mode="full",
     ):
         """初始化物理适配器（在模型加载后调用）"""
         if self.physics_adapter is None:
@@ -1844,6 +2147,8 @@ class PhysicsInformedWanVideoPipeline(WanVideoPipeline):
                 rl_hidden_dim=rl_hidden_dim,
                 rl_reward_decay=rl_reward_decay,
                 strict_physical_state_contract=strict_physical_state_contract,
+                excluded_expert_names=excluded_expert_names,
+                core_ablation_mode=core_ablation_mode,
             ).to(self.device)
             print(f"✓ Physics Adapter initialized (latent_dim={latent_dim})")
         return self.physics_adapter
@@ -2056,5 +2361,29 @@ def _build_spatial_snapshot(step, v_orig, v_corr, diff, adapter):
         raw_map = raw[b].abs().mean(dim=0).cpu().numpy().astype(np.float32)
         snap["raw_correction_map"] = raw_map
         snap["motion_weighted_correction_map"] = (raw_map * motion_mask_map).astype(np.float32)
+
+    if hasattr(adapter, "_cache") and "expert_correction_maps" in adapter._cache:
+        expert_maps = adapter._cache.get("expert_correction_maps")
+        expert_ids = adapter._cache.get("active_expert_indices")
+        expert_weights = adapter._cache.get("active_expert_weights")
+        if (
+            torch.is_tensor(expert_maps)
+            and expert_maps.ndim == 5
+            and b < expert_maps.shape[0]
+            and torch.is_tensor(expert_ids)
+            and torch.is_tensor(expert_weights)
+            and b < expert_ids.shape[0]
+            and b < expert_weights.shape[0]
+        ):
+            ids_np = expert_ids[b].detach().cpu().numpy().astype(np.int32)
+            weights_np = expert_weights[b].detach().float().cpu().numpy().astype(np.float32)
+            names_np = np.asarray(
+                [adapter.phenomenon_name_from_index(int(idx)) for idx in ids_np],
+                dtype=str,
+            )
+            snap["expert_correction_maps"] = expert_maps[b].float().cpu().numpy().astype(np.float32)
+            snap["expert_ids"] = ids_np
+            snap["expert_weights"] = weights_np
+            snap["expert_names"] = names_np
     
     return snap

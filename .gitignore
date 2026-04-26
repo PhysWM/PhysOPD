@@ -26,3 +26,12 @@ phygenbench_videos_wan21_pinn_batch/
 outputs/
 output_videos_wan21_pinn_batch/
 tests/
+phygenbench_hunyuan/
+phygenbench_videos_wan22_pinn_batch/
+phygenbench_router_wan21_step1/
+diffsynth/__pycache__/
+diffsynth/data/__pycache__/
+experiments/
+phygenbench_moe_topk_ablation/
+phygenbench_router_wan21_step1_full160/
+phygenbench_router_wan21_step1_logits/
