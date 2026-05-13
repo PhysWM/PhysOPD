@@ -69,8 +69,8 @@
 /.vscode/
 /.github/
 /apps/
-examples/CogvideoX
-examples/ControlNet
+/examples/CogVideoX/
+/examples/ControlNet/
 /examples/HunyuanVideo/
 /examples/flux/
 /examples/image_quality_metric/
