@@ -70,7 +70,7 @@
 /.github/
 /apps/
 /examples/CogvideoX/
-/examples/ControlNet/
+examples/ControlNet
 /examples/HunyuanVideo/
 /examples/flux/
 /examples/image_quality_metric/
