@@ -11,13 +11,15 @@ fi
 # export OPENAI_API_KEY=...
 # export OPENAI_BASE_URL=https://api.openai.com/v1
 # export OPENAI_MODEL=gpt-4.1-mini
+export CUDA_VISIBLE_DEVICES=0
 
 # Basic inference with automatic LLM routing labels
-python examples/wanvideo/pinn_inference/inference_pinn2.py \
-    --prompt "Placing an egg in a pan." \
-    --checkpoint_path models/train/pinn_plugin_low_noise/pinn_plugin_final.pt \
+/home/dataset-assist-0/algorithm/cong.wang/miniconda3/envs/wan/bin/python examples/wanvideo/pinn_inference/inference_pinn.py \
+    --prompt "自然的环境里，一个石头掉到河里，激起了水花." \
+    --checkpoint_path /home/dataset-assist-0/algorithm/cong.wang/DiffSynth-Studio/models/train/wan21_stage2_fullpinn8/step-18500.pt \
     --auto_label_from_prompt \
-    --output video_pinn_egg2.mp4
+    --model_id Wan-AI/Wan2.2-T2V-A14B \
+    --output stone.mp4
 
 # Raw n/q metadata inference (recommended if you want to override routing manually)
 # You can pass raw fields directly; script will auto-encode to adapter metadata.

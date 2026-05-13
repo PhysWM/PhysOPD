@@ -4121,7 +4121,11 @@ class WanPINNTrainingModule(DiffusionTrainingModule):
         explicit_physical_interface = bool(
             getattr(self.physics_adapter, "interpret_attribute_bank_as_physical", True)
         )
-        if explicit_physical_interface:
+        active_physical_mask_enabled = bool(
+            explicit_physical_interface
+            and self.core_ablation_mode != "wo_physical_mask"
+        )
+        if active_physical_mask_enabled:
             physical_mask, physical_mask_info = self._build_active_physical_mask(
                 fused_attribute_bank,
                 metadata=metadata,
@@ -4133,6 +4137,12 @@ class WanPINNTrainingModule(DiffusionTrainingModule):
                 self.motion_mask_floor,
                 1.0,
             )
+            if self.core_ablation_mode == "wo_physical_mask":
+                physical_mask_source = "wo_physical_mask_bootstrap_motion_mask"
+                physical_mask_recipe_version = "active_physical_mask_disabled_bootstrap"
+            else:
+                physical_mask_source = f"{self.core_ablation_mode}_bootstrap_motion_mask"
+                physical_mask_recipe_version = "no_explicit_physical_interface"
             physical_mask_info = {
                 "active_phenomena": [[] for _ in range(v_original.shape[0])],
                 "active_fields": [[] for _ in range(v_original.shape[0])],
@@ -4141,8 +4151,8 @@ class WanPINNTrainingModule(DiffusionTrainingModule):
                     device=v_original.device,
                     dtype=v_original.dtype,
                 ),
-                "source": f"{self.core_ablation_mode}_bootstrap_motion_mask",
-                "recipe_version": "no_explicit_physical_interface",
+                "source": physical_mask_source,
+                "recipe_version": physical_mask_recipe_version,
             }
         effective_motion_mask, physical_mask_blend_alpha = self._blend_motion_masks(
             bootstrap_motion_mask.detach(),
@@ -4157,10 +4167,13 @@ class WanPINNTrainingModule(DiffusionTrainingModule):
         metadata["physical_mask"] = physical_mask.detach()
         metadata["effective_motion_mask"] = effective_motion_mask.detach()
         metadata["motion_mask"] = effective_motion_mask.detach()
-        metadata["motion_mask_source"] = (
-            "active_physical_blend"
-            if physical_mask_blend_alpha < 1.0 else "fused_active_physical"
-        )
+        if active_physical_mask_enabled:
+            metadata["motion_mask_source"] = (
+                "active_physical_blend"
+                if physical_mask_blend_alpha < 1.0 else "fused_active_physical"
+            )
+        else:
+            metadata["motion_mask_source"] = physical_mask_info["source"]
         metadata["physical_mask_source"] = physical_mask_info["source"]
         metadata["physical_mask_recipe_version"] = physical_mask_info["recipe_version"]
         metadata["physical_mask_blend_alpha"] = torch.full(
@@ -4186,7 +4199,8 @@ class WanPINNTrainingModule(DiffusionTrainingModule):
             **self._collect_mask_metrics(bootstrap_motion_mask, prefix="bootstrap_motion_mask"),
             **self._collect_mask_metrics(physical_mask, prefix="physical_mask"),
             "physical_mask_blend_alpha": float(physical_mask_blend_alpha),
-            "physical_mask_source_fused_field": 1.0,
+            "active_physical_mask_enabled": float(active_physical_mask_enabled),
+            "physical_mask_source_fused_field": float(active_physical_mask_enabled),
             "physical_mask_active_field_count": float(
                 metadata["physical_mask_active_field_count"].detach().float().mean().item()
             ),
@@ -4324,6 +4338,14 @@ class WanPINNTrainingModule(DiffusionTrainingModule):
             "phenomenon": phenomenon,
             "core_ablation_mode": self.core_ablation_mode,
             "explicit_physical_interface": float(explicit_physical_interface),
+            "active_physical_mask_enabled": float(active_physical_mask_enabled),
+            "proxy_only_physical_state": float(
+                bool(cache.get("proxy_only_physical_state", False))
+            ),
+            "learned_physical_state_recovery": float(
+                bool(cache.get("learned_physical_state_recovery", True))
+            ),
+            "proxy_field_bank_source": cache.get("proxy_field_bank_source"),
             "physics_to_flow_injection_enabled": float(
                 getattr(self.physics_adapter, "physics_to_flow_injection_enabled", True)
             ),

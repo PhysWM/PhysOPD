@@ -18,8 +18,24 @@ import imageio.v2 as imageio
 import matplotlib
 
 matplotlib.use("Agg")
+from matplotlib import font_manager
 import matplotlib.pyplot as plt
 import numpy as np
+
+REPORT_FONT = "Times New Roman"
+for font_path in [
+    "/home/dataset-assist-0/dengyan/bishe/4DLangSplat_redo/4DLangSplat-main/utils/TIMES.TTF",
+    "/home/dataset-assist-0/dengyan/bishe/4DLangSplat_redo/4DLangSplat-main/utils/TIMESBD.TTF",
+    "/home/dataset-assist-0/dengyan/bishe/4DLangSplat_redo/4DLangSplat-main/utils/TIMESI.TTF",
+    "/home/dataset-assist-0/dengyan/bishe/4DLangSplat_redo/4DLangSplat-main/utils/TIMESBI.TTF",
+]:
+    if Path(font_path).exists():
+        font_manager.fontManager.addfont(font_path)
+plt.rcParams.update({
+    "font.family": REPORT_FONT,
+    "font.serif": [REPORT_FONT],
+    "font.sans-serif": [REPORT_FONT],
+})
 
 
 def _read_video_frames(path: Path, indices: np.ndarray) -> dict[int, np.ndarray]:
@@ -94,12 +110,25 @@ def _justify_prompt(prompt: str, max_words: int = 18, width: int = 25) -> str:
     return "\n".join(justified)
 
 
-def _wrap_prompt_left(prompt: str, max_words: int = 16, width: int = 22) -> str:
+def _wrap_prompt_left(prompt: str, max_words: int | None = 16, width: int = 22) -> str:
     clean = " ".join(str(prompt or "").split())
     words = clean.split()
-    if len(words) > max_words:
+    if max_words is not None and len(words) > max_words:
         clean = " ".join(words[:max_words]) + "..."
     return textwrap.fill(clean, width=width)
+
+
+def _shorten_expert_name(name: str) -> str:
+    aliases = {
+        "Compressible Flow": "Compressible",
+        "Collision/Contact": "Collision",
+        "Phase Change": "Phase",
+        "Rigid Body": "Rigid",
+    }
+    name = str(name)
+    if name in aliases:
+        return aliases[name]
+    return name[:13] + "..." if len(name) > 15 else name
 
 
 def _plot_correction_report(
@@ -162,11 +191,15 @@ def _plot_correction_report(
         ha="right",
         va="center",
         fontsize=9.0,
-        family="serif",
+        family=REPORT_FONT,
         linespacing=1.18,
     )
 
-    titles = ["No PINN", "PINN correction", "PINN output"] if has_baseline else ["PINN correction", "PINN output"]
+    titles = (
+        ["Base Generator", "Physics Correction", "PILA Output"]
+        if has_baseline
+        else ["Physics Correction", "PILA Output"]
+    )
     for row, frame_idx in enumerate(indices):
         frame_idx = int(frame_idx)
         frame = frames[frame_idx]
@@ -187,7 +220,7 @@ def _plot_correction_report(
             ax.set_xticks([])
             ax.set_yticks([])
             if row == 0:
-                ax.set_title(titles[col - 1], fontsize=10.5, fontweight="bold", family="serif", pad=5)
+                ax.set_title(titles[col - 1], fontsize=10.5, fontweight="bold", family=REPORT_FONT, pad=5)
             for spine in ax.spines.values():
                 spine.set_color("white")
                 spine.set_linewidth(1.4)
@@ -210,7 +243,7 @@ def _plot_multi_example_report(
     alpha: float,
 ) -> None:
     rows = []
-    for example in examples:
+    for example in examples[:3]:
         video_path = Path(example["video"])
         baseline_path = Path(example["baseline_video"])
         trace_path = Path(example["trace"])
@@ -247,9 +280,9 @@ def _plot_multi_example_report(
     frame_h, frame_w = sample.shape[:2]
     aspect = frame_h / max(float(frame_w), 1.0)
     n_rows = len(rows)
-    prompt_w = 1.72
+    prompt_w = 1.35
     cell_w = 1.95
-    weights_w = 2.95
+    weights_w = 2.18
     cell_h = cell_w * aspect
     fig_w = prompt_w + cell_w * 3 + weights_w
     fig_h = 0.42 + cell_h * n_rows
@@ -266,21 +299,21 @@ def _plot_multi_example_report(
         hspace=0.06,
     )
 
-    titles = ["No PINN", "PINN correction", "PINN output"]
+    titles = ["Base Generator", "Physics Correction", "PILA Output"]
 
     for row_idx, row in enumerate(rows):
         prompt_ax = fig.add_subplot(grid[row_idx, 0])
         prompt_ax.axis("off")
         prompt = row["prompt"]
         prompt_ax.text(
-            0.05,
+            0.50,
             0.5,
-            _wrap_prompt_left(prompt, max_words=16, width=22),
-            ha="left",
+            _wrap_prompt_left(prompt, max_words=None, width=23),
+            ha="center",
             va="center",
-            fontsize=8.2,
-            family="serif",
-            linespacing=1.12,
+            fontsize=8.4,
+            family=REPORT_FONT,
+            linespacing=1.04,
         )
 
         panels = [
@@ -297,7 +330,7 @@ def _plot_multi_example_report(
             ax.set_xticks([])
             ax.set_yticks([])
             if row_idx == 0:
-                ax.set_title(titles[col - 1], fontsize=10.5, fontweight="bold", family="serif", pad=5)
+                ax.set_title(titles[col - 1], fontsize=10.5, fontweight="bold", family=REPORT_FONT, pad=5)
             for spine in ax.spines.values():
                 spine.set_color("white")
                 spine.set_linewidth(1.2)
@@ -373,8 +406,8 @@ def _plot_expert_weights_panel(
     if names is None or weights is None:
         ax.axis("off")
         if title:
-            ax.set_title("Expert weights", fontsize=10.5, fontweight="bold", family="serif", pad=5)
-        ax.text(0.5, 0.5, "N/A", ha="center", va="center", fontsize=9, family="serif")
+            ax.set_title("Routed Experts", fontsize=10.5, fontweight="bold", family=REPORT_FONT, pad=5)
+        ax.text(0.5, 0.5, "N/A", ha="center", va="center", fontsize=9, family=REPORT_FONT)
         return
 
     names_arr = np.asarray(names).astype(str).reshape(-1)
@@ -396,47 +429,46 @@ def _plot_expert_weights_panel(
     if compact and not show_axis:
         ax.axis("off")
         if title:
-            ax.set_title("Expert weights", fontsize=10.5, fontweight="bold", family="serif", pad=5)
+            ax.set_title("Routed Experts", fontsize=10.5, fontweight="bold", family=REPORT_FONT, pad=5)
         display_names = []
         for name in names_arr:
-            name = str(name)
-            display_names.append(name[:12] + "..." if len(name) > 14 else name)
-        max_width = max(float(weights_arr.max()), 1.0)
-        y_positions = np.linspace(0.80, 0.20, n)
+            display_names.append(_shorten_expert_name(str(name)))
+        max_width = max(float(weights_arr.max()), 1e-6)
+        y_positions = np.linspace(0.82, 0.18, n)
         for name, val, y_pos in zip(display_names, weights_arr, y_positions):
             val = float(val)
             ax.text(
-                0.02,
-                y_pos,
+                0.035,
+                y_pos + 0.045,
                 name,
                 transform=ax.transAxes,
                 ha="left",
                 va="center",
-                fontsize=6.0,
-                family="serif",
+                fontsize=7.2,
+                family=REPORT_FONT,
             )
-            bar_x = 0.38
-            bar_w = 0.46 * val / max_width
+            ax.text(
+                0.93,
+                y_pos + 0.045,
+                f"{val:.2f}",
+                transform=ax.transAxes,
+                ha="right",
+                va="center",
+                fontsize=7.2,
+                family=REPORT_FONT,
+            )
+            bar_x = 0.035
+            bar_w = 0.80 * val / max_width
             ax.add_patch(
                 plt.Rectangle(
-                    (bar_x, y_pos - 0.025),
+                    (bar_x, y_pos - 0.035),
                     bar_w,
-                    0.05,
+                    0.045,
                     transform=ax.transAxes,
                     facecolor="#4c78a8",
                     edgecolor="none",
                     clip_on=False,
                 )
-            )
-            ax.text(
-                min(bar_x + bar_w + 0.025, 0.84),
-                y_pos,
-                f"{val:.2f}",
-                transform=ax.transAxes,
-                ha="left",
-                va="center",
-                fontsize=6.0,
-                family="serif",
             )
         ax.add_patch(
             plt.Rectangle(
@@ -464,7 +496,7 @@ def _plot_expert_weights_panel(
     ax.invert_yaxis()
     ax.set_xlim(-0.02, max(1.0, float(weights_arr.max()) * 1.18))
     if title:
-        ax.set_title("Expert weights", fontsize=10.5, fontweight="bold", family="serif", pad=5)
+        ax.set_title("Routed Experts", fontsize=10.5, fontweight="bold", family=REPORT_FONT, pad=5)
     if show_axis:
         ax.tick_params(axis="x", labelsize=6.5 if compact else 7, length=2, pad=1)
         ax.grid(axis="x", alpha=0.12, linewidth=0.5)
@@ -479,7 +511,7 @@ def _plot_expert_weights_panel(
             va="center",
             ha="left",
             fontsize=5.6 if compact else 7.3,
-            family="serif",
+            family=REPORT_FONT,
         )
         ax.text(
             min(float(val) + 0.015, 0.98),
@@ -554,7 +586,7 @@ def _plot_expert_overlap(metrics: dict[str, object], output_prefix: Path) -> Non
         (axes[1], iou, f"Top-region IoU p{metrics['keep_percentile']:.0f}"),
     ]:
         im = ax.imshow(matrix, cmap="viridis", vmin=0.0, vmax=1.0)
-        ax.set_title(title, fontsize=10.5, fontweight="bold", family="serif")
+        ax.set_title(title, fontsize=10.5, fontweight="bold", family=REPORT_FONT)
         ax.set_xticks(range(len(names)))
         ax.set_yticks(range(len(names)))
         ax.set_xticklabels(names, rotation=35, ha="right", fontsize=8)

@@ -31,8 +31,8 @@ if [[ -f ".pinn_api.env" ]]; then
 fi
 
 CSV="${CSV:-videophy_test_public.csv}"
-OUTPUT_DIR="${OUTPUT_DIR:-output_videos_pinn_corrected}"
-CHECKPOINT="${CHECKPOINT:-/home/dataset-assist-0/algorithm/cong.wang/DiffSynth-Studio/models/train/wan21_stage2_fullpinn7/step-2500.pt}"
+OUTPUT_DIR="${OUTPUT_DIR:-output_videos_pinn_corrected2}"
+CHECKPOINT="${CHECKPOINT:-/home/dataset-assist-0/algorithm/cong.wang/DiffSynth-Studio/models/train/wan21_stage2_fullpinn8/step-18500.pt}"
 LOG_DIR="${LOG_DIR:-}"
 TOTAL=344
 AUTO_LABEL_FROM_PROMPT="${AUTO_LABEL_FROM_PROMPT:-1}"

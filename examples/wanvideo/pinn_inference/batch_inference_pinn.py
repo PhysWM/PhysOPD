@@ -177,7 +177,12 @@ def append_performance_record(path, record: dict[str, Any]):
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
-def performance_record_exists(path, sample_id: int) -> bool:
+def performance_record_exists(
+    path,
+    sample_id: int,
+    benchmark_repeat: int | None = None,
+    benchmark_phase: str | None = None,
+) -> bool:
     if path is None or not path.exists():
         return False
     try:
@@ -190,8 +195,13 @@ def performance_record_exists(path, sample_id: int) -> bool:
                     record = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                if int(record.get("sample_id", -1)) == int(sample_id):
-                    return True
+                if int(record.get("sample_id", -1)) != int(sample_id):
+                    continue
+                if benchmark_repeat is not None and record.get("benchmark_repeat") != benchmark_repeat:
+                    continue
+                if benchmark_phase is not None and record.get("benchmark_phase") != benchmark_phase:
+                    continue
+                return True
     except OSError:
         return False
     return False
@@ -383,6 +393,20 @@ def extract_prompt_from_row(row):
     if caption.startswith('"') and caption.endswith('"'):
         caption = caption[1:-1]
     return caption
+
+
+def source_sample_id_from_row(row, fallback_id: int):
+    if not isinstance(row, dict):
+        return int(fallback_id)
+    for key in ("source_sample_id", "original_sample_id", "phygenbench_id", "source_id"):
+        value = _safe_text(row.get(key, ""))
+        if value == "":
+            continue
+        try:
+            return int(value)
+        except ValueError:
+            continue
+    return int(fallback_id)
 
 
 def build_wan_model_configs(model_id):
@@ -723,6 +747,21 @@ def main():
         default=None,
         help="JSONL path for per-sample generation/save/time/memory records. Default: output_dir/performance_metrics.jsonl.",
     )
+    parser.add_argument("--benchmark_name", type=str, default=None, help="Optional benchmark tag written to performance records.")
+    parser.add_argument("--benchmark_repeat", type=int, default=None, help="Optional repeat id written to performance records.")
+    parser.add_argument(
+        "--benchmark_phase",
+        type=str,
+        default="measure",
+        choices=("measure", "warmup"),
+        help="Benchmark phase for selected samples. Warmup samples are usually passed via --benchmark_warmup_sample_ids.",
+    )
+    parser.add_argument(
+        "--benchmark_warmup_sample_ids",
+        type=str,
+        default="1",
+        help="Optional comma/space separated 1-based CSV IDs to run before measured samples in the same loaded model process.",
+    )
 
     # 设备
     parser.add_argument("--device", type=str, default="cuda")
@@ -826,6 +865,7 @@ def main():
         sys.exit(1)
 
     sample_ids = parse_sample_ids(args.sample_ids)
+    warmup_sample_ids = parse_sample_ids(args.benchmark_warmup_sample_ids)
     if sample_ids:
         invalid_ids = [vid_id for vid_id in sample_ids if vid_id < 1 or vid_id > total]
         if invalid_ids:
@@ -841,11 +881,23 @@ def main():
             print(f"Error: start_id ({start_id}) > end_id ({end_id}) or out of range [1, {total}]")
             sys.exit(1)
         selected_id_list = list(range(start_id, end_id + 1))
+    if warmup_sample_ids:
+        invalid_warmup_ids = [vid_id for vid_id in warmup_sample_ids if vid_id < 1 or vid_id > total]
+        if invalid_warmup_ids:
+            print(f"Error: benchmark_warmup_sample_ids out of range [1, {total}]: {invalid_warmup_ids}")
+            sys.exit(1)
 
     print("=" * 80)
     print(f"Batch PINN Inference: IDs {start_id}-{end_id} / {total} total")
     if sample_ids:
         print(f"Selected sample IDs: {selected_id_list}")
+    if warmup_sample_ids:
+        print(f"Benchmark warmup sample IDs: {warmup_sample_ids}")
+    if args.benchmark_name is not None or args.benchmark_repeat is not None:
+        print(
+            f"Benchmark: name={args.benchmark_name}, repeat={args.benchmark_repeat}, "
+            f"phase={args.benchmark_phase}"
+        )
     print(f"CSV: {csv_path}")
     print(f"Output: {output_dir}")
     print(f"MoE top-k override: {args.moe_top_k if args.moe_top_k is not None else 'checkpoint default'}")
@@ -937,23 +989,38 @@ def main():
     else:
         ids_to_process = selected_id_list
 
+    run_items = [("warmup", int(vid_id)) for vid_id in warmup_sample_ids]
+    run_items.extend((args.benchmark_phase, int(vid_id)) for vid_id in ids_to_process)
+
     print(f"[3/3] Generating videos {start_id}-{end_id}...")
-    for vid_id in ids_to_process:
+    if warmup_sample_ids:
+        print(f"    Warmup runs: {len(warmup_sample_ids)}; measured runs: {len(list(ids_to_process))}")
+    for benchmark_phase, vid_id in run_items:
+        benchmark_is_warmup = benchmark_phase == "warmup"
         idx = vid_id - 1  # 0-based index
         row = rows[idx]
         caption = extract_prompt_from_row(row)
-        out_name = f"{vid_id:04d}.mp4"
+        source_sample_id = source_sample_id_from_row(row, vid_id)
+        out_name = f"warmup_{vid_id:04d}.mp4" if benchmark_is_warmup else f"{vid_id:04d}.mp4"
         out_path = output_dir / out_name
 
         if args.skip_existing and out_path.exists():
-            print(f"  [{vid_id:4d}/{total}] Skip (exists): {out_name}")
-            if not performance_record_exists(performance_metrics_path, vid_id):
+            phase_text = "warmup" if benchmark_is_warmup else "measure"
+            print(f"  [{vid_id:4d}/{total}] ({phase_text}) Skip (exists): {out_name}")
+            lookup_repeat = args.benchmark_repeat if args.benchmark_name is not None or args.benchmark_repeat is not None else None
+            lookup_phase = benchmark_phase if args.benchmark_name is not None or args.benchmark_repeat is not None or benchmark_is_warmup else None
+            if not performance_record_exists(performance_metrics_path, vid_id, lookup_repeat, lookup_phase):
                 append_performance_record(performance_metrics_path, {
                     "sample_id": int(vid_id),
+                    "source_sample_id": int(source_sample_id),
                     "output_path": str(out_path),
                     "skipped": True,
                     "success": True,
                     "error": None,
+                    "benchmark_name": args.benchmark_name,
+                    "benchmark_repeat": args.benchmark_repeat,
+                    "benchmark_phase": benchmark_phase,
+                    "warmup": bool(benchmark_is_warmup),
                     "model_id": args.model_id,
                     "checkpoint_path": str(args.checkpoint_path),
                     "requested_moe_top_k": args.moe_top_k,
@@ -990,7 +1057,8 @@ def main():
             )
             metadata_mode = "llm_auto_label"
         pinn_metadata = sanitize_metadata_labels(pinn_metadata, excluded_expert_names)
-        print(f"  [{vid_id:4d}/{total}] {original_caption[:60]}{'...' if len(original_caption) > 60 else ''} -> {out_name}")
+        phase_text = "warmup" if benchmark_is_warmup else "measure"
+        print(f"  [{vid_id:4d}/{total}] ({phase_text}) {original_caption[:60]}{'...' if len(original_caption) > 60 else ''} -> {out_name}")
         if prompt_refinement is not None:
             if prompt_refinement.get("used_refinement"):
                 print(
@@ -1026,6 +1094,11 @@ def main():
             if router_hook is not None:
                 router_hook.start_sample({
                     "sample_id": int(vid_id),
+                    "source_sample_id": int(source_sample_id),
+                    "benchmark_name": args.benchmark_name,
+                    "benchmark_repeat": args.benchmark_repeat,
+                    "benchmark_phase": benchmark_phase,
+                    "warmup": bool(benchmark_is_warmup),
                     "prompt": original_caption,
                     "effective_prompt": effective_prompt,
                     "metadata_mode": metadata_mode,
@@ -1075,10 +1148,15 @@ def main():
             peak_allocated_gb, peak_reserved_gb = cuda_memory_gb(args.device)
             append_performance_record(performance_metrics_path, {
                 "sample_id": int(vid_id),
+                "source_sample_id": int(source_sample_id),
                 "output_path": str(out_path),
                 "skipped": False,
                 "success": True,
                 "error": None,
+                "benchmark_name": args.benchmark_name,
+                "benchmark_repeat": args.benchmark_repeat,
+                "benchmark_phase": benchmark_phase,
+                "warmup": bool(benchmark_is_warmup),
                 "prompt": original_caption,
                 "effective_prompt": effective_prompt,
                 "metadata_mode": metadata_mode,
@@ -1112,10 +1190,15 @@ def main():
             total_seconds = time.perf_counter() - total_start
             append_performance_record(performance_metrics_path, {
                 "sample_id": int(vid_id),
+                "source_sample_id": int(source_sample_id),
                 "output_path": str(out_path),
                 "skipped": False,
                 "success": False,
                 "error": str(e),
+                "benchmark_name": args.benchmark_name,
+                "benchmark_repeat": args.benchmark_repeat,
+                "benchmark_phase": benchmark_phase,
+                "warmup": bool(benchmark_is_warmup),
                 "prompt": original_caption,
                 "effective_prompt": effective_prompt,
                 "metadata_mode": metadata_mode,

@@ -3,6 +3,7 @@ Physics-Informed Flow Matching for Video Generation
 基于物理约束的视频生成 Pipeline
 """
 import os
+import re
 import shutil
 import torch
 import torch.nn as nn
@@ -45,6 +46,9 @@ class PhysicsInformedWanVideoPipeline(WanVideoPipeline):
         self.pde_residuals.requires_grad_(False)
         self.material_classifier = MaterialClassifier()
         self.physics_adapter = None  # 延迟初始化，在加载模型后
+        self.pinn_step_range = "all"
+        self._pinn_step_ranges = None
+        self._pinn_local_step = 0
         
         # 物理损失权重（可调节）
         self.lambda_physics = 0.1  # 物理损失权重
@@ -620,6 +624,55 @@ class PhysicsInformedWanVideoPipeline(WanVideoPipeline):
         else:
             raise RuntimeError(f"Unsupported material_type for explicit physics loss: {material_type!r}")
     
+    @staticmethod
+    def _parse_pinn_step_range(step_range):
+        if step_range is None:
+            return None, "all"
+        text = str(step_range).strip()
+        if text == "":
+            return None, "all"
+        lowered = re.sub(r"\s+", "", text.lower())
+        if lowered in {"all", "full", "*"}:
+            return None, "all"
+        if lowered in {"none", "off", "no_pinn", "no-pinn", "disabled", "disable", "0"}:
+            return [], "none"
+
+        normalized = re.sub(r"\s*-\s*", "-", text)
+        chunks = [chunk for chunk in re.split(r"[,\s;]+", normalized) if chunk]
+        ranges = []
+        for chunk in chunks:
+            try:
+                if "-" in chunk:
+                    parts = chunk.split("-", 1)
+                    if len(parts) != 2 or parts[0] == "" or parts[1] == "":
+                        raise ValueError
+                    start = int(parts[0])
+                    end = int(parts[1])
+                else:
+                    start = int(chunk)
+                    end = start
+            except ValueError as exc:
+                raise ValueError(
+                    f"Invalid pinn_step_range={step_range!r}; expected examples like "
+                    "'41-50', '1-10,21-30', 'all', or 'none'."
+                ) from exc
+            if start <= 0 or end <= 0 or start > end:
+                raise ValueError(
+                    f"Invalid pinn_step_range={step_range!r}; step ranges must be positive and start <= end."
+                )
+            ranges.append((start, end))
+
+        if not ranges:
+            return None, "all"
+        label = ",".join(f"{start}-{end}" if start != end else str(start) for start, end in ranges)
+        return ranges, label
+
+    @staticmethod
+    def _pinn_step_is_active(step, ranges):
+        if ranges is None:
+            return True
+        return any(start <= step <= end for start, end in ranges)
+
     def load_pinn_plugin(
         self,
         checkpoint_path,
@@ -630,6 +683,7 @@ class PhysicsInformedWanVideoPipeline(WanVideoPipeline):
         expert_attention_apply_router_weight=True,
         moe_top_k_override=None,
         excluded_expert_names=None,
+        pinn_step_range=None,
     ):
         """
         加载 PINN 插件并将 adapter 接入推理流程。
@@ -644,9 +698,15 @@ class PhysicsInformedWanVideoPipeline(WanVideoPipeline):
             expert_attention_apply_router_weight: 是否用 router weight 缩放每个 expert contribution
             moe_top_k_override: 覆盖 checkpoint 中保存的 MoE active expert count；允许为 0
             excluded_expert_names: 运行时从路由和 label prior 中排除的专家名称列表
+            pinn_step_range: PINN 校正生效的 denoising step（1-indexed, inclusive），如 "41-50"、"1-10,21-30"、"all"、"none"
         """
         if device is None:
             device = self.device
+        step_gate_enabled = pinn_step_range is not None and str(pinn_step_range).strip() != ""
+        step_ranges, step_range_label = self._parse_pinn_step_range(pinn_step_range)
+        self._pinn_step_ranges = step_ranges
+        self.pinn_step_range = step_range_label
+        self._pinn_local_step = 0
 
         checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
         config = checkpoint.get("config", {})
@@ -894,6 +954,15 @@ class PhysicsInformedWanVideoPipeline(WanVideoPipeline):
             timestep = kwargs.get("timestep")
             if timestep is None:
                 return v_original
+            if step_gate_enabled:
+                pipeline_ref._pinn_local_step += 1
+                step = int(pipeline_ref._pinn_local_step)
+                step_requested = pipeline_ref._pinn_step_is_active(step, pipeline_ref._pinn_step_ranges)
+            else:
+                _step[0] += 1
+                step = _step[0]
+                step_requested = True
+            correction_applied = bool(step_requested and not observable_inspection_only)
             
             adapter.to(device=v_original.device, dtype=v_original.dtype)
             adapter_metadata = pipeline_ref._prepare_adapter_metadata(
@@ -920,16 +989,15 @@ class PhysicsInformedWanVideoPipeline(WanVideoPipeline):
                 )
                 observable_outputs = observable_stage.get("observable_outputs")
                 v_corrected = v_original
-            else:
+            elif correction_applied:
                 v_corrected = adapter(
                     v_original,
                     physics_state_original,
                     sigma=sigma,
                     metadata=adapter_metadata,
                 )
-            
-            _step[0] += 1
-            step = _step[0]
+            else:
+                v_corrected = v_original
             
             with torch.no_grad():
                 # 始终保存最新的 v_original，用于推理结束后的像素空间对比
@@ -943,18 +1011,23 @@ class PhysicsInformedWanVideoPipeline(WanVideoPipeline):
                 v_cf = v_corrected.float()
                 diff = v_cf - v_of
                 scale_val = adapter.scale.item()
-                effective_scale_tensor = adapter._cache.get("effective_scale")
-                effective_scale = float(
-                    effective_scale_tensor.detach().float().mean().item()
-                ) if isinstance(effective_scale_tensor, torch.Tensor) and effective_scale_tensor.numel() > 0 else float("nan")
-                raw_correction_norm_tensor = adapter._cache.get("raw_correction_norm")
-                raw_correction_norm = float(
-                    raw_correction_norm_tensor.detach().float().mean().item()
-                ) if isinstance(raw_correction_norm_tensor, torch.Tensor) and raw_correction_norm_tensor.numel() > 0 else float("nan")
-                gated_correction_norm_tensor = adapter._cache.get("gated_correction_norm")
-                gated_correction_norm = float(
-                    gated_correction_norm_tensor.detach().float().mean().item()
-                ) if isinstance(gated_correction_norm_tensor, torch.Tensor) and gated_correction_norm_tensor.numel() > 0 else float("nan")
+                if correction_applied:
+                    effective_scale_tensor = adapter._cache.get("effective_scale")
+                    effective_scale = float(
+                        effective_scale_tensor.detach().float().mean().item()
+                    ) if isinstance(effective_scale_tensor, torch.Tensor) and effective_scale_tensor.numel() > 0 else float("nan")
+                    raw_correction_norm_tensor = adapter._cache.get("raw_correction_norm")
+                    raw_correction_norm = float(
+                        raw_correction_norm_tensor.detach().float().mean().item()
+                    ) if isinstance(raw_correction_norm_tensor, torch.Tensor) and raw_correction_norm_tensor.numel() > 0 else float("nan")
+                    gated_correction_norm_tensor = adapter._cache.get("gated_correction_norm")
+                    gated_correction_norm = float(
+                        gated_correction_norm_tensor.detach().float().mean().item()
+                    ) if isinstance(gated_correction_norm_tensor, torch.Tensor) and gated_correction_norm_tensor.numel() > 0 else float("nan")
+                else:
+                    effective_scale = 0.0
+                    raw_correction_norm = 0.0
+                    gated_correction_norm = 0.0
                 corr_ratio = diff.abs().mean().item() / (v_of.abs().mean().item() + 1e-10)
                 
                 div_orig = _compute_divergence_sq(v_of)
@@ -975,6 +1048,7 @@ class PhysicsInformedWanVideoPipeline(WanVideoPipeline):
                     t["final_sigma"] = sigma.detach().to(device="cpu", dtype=torch.float32)
                 
                 t["steps"].append(step)
+                t["correction_applied"].append(bool(correction_applied))
                 t["scale"].append(scale_val)
                 t["effective_scale"].append(effective_scale)
                 t["raw_correction_norm"].append(raw_correction_norm)
@@ -987,32 +1061,46 @@ class PhysicsInformedWanVideoPipeline(WanVideoPipeline):
                 t["smooth_before"].append(smooth_orig)
                 t["smooth_after"].append(smooth_corr)
                 
-                if step in _snapshot_steps:
+                if (correction_applied or not step_gate_enabled) and step in _snapshot_steps:
                     snap = _build_spatial_snapshot(step, v_of, v_cf, diff, adapter)
                     t["snapshots"].append(snap)
                 
                 if step <= 3 or step % 10 == 0:
                     div_d = (div_corr - div_orig) / (div_orig + 1e-10) * 100
-                    print(f"  [Step {step:3d}] scale={scale_val:.6f}  "
-                          f"eff={effective_scale:.6f}  "
-                          f"raw={raw_correction_norm:.6f}  "
-                          f"gated={gated_correction_norm:.6f}  "
-                          f"corr={corr_ratio:.4%}  "
-                          f"div: {div_orig:.6f}→{div_corr:.6f} ({div_d:+.1f}%)")
+                    if step_gate_enabled:
+                        print(f"  [Step {step:3d}] active={int(correction_applied)}  "
+                              f"scale={scale_val:.6f}  "
+                              f"eff={effective_scale:.6f}  "
+                              f"raw={raw_correction_norm:.6f}  "
+                              f"gated={gated_correction_norm:.6f}  "
+                              f"corr={corr_ratio:.4%}  "
+                              f"div: {div_orig:.6f}→{div_corr:.6f} ({div_d:+.1f}%)")
+                    else:
+                        print(f"  [Step {step:3d}] scale={scale_val:.6f}  "
+                              f"eff={effective_scale:.6f}  "
+                              f"raw={raw_correction_norm:.6f}  "
+                              f"gated={gated_correction_norm:.6f}  "
+                              f"corr={corr_ratio:.4%}  "
+                              f"div: {div_orig:.6f}→{div_corr:.6f} ({div_d:+.1f}%)")
             
             return v_corrected
         
         self.model_fn = model_fn_with_adapter
         self._last_v_original = _last_v_original  # 暴露给外部
         print("  model_fn wrapped with PhysicsAdapter + PDE tracking")
+        if step_gate_enabled:
+            print(f"  PINN correction step range: {self.pinn_step_range}")
         if observable_inspection_only:
             print("  Observable inspection only: adapter correction is disabled, encoder diagnostics enabled")
         print("  PINN plugin loaded successfully")
     
     def reset_tracking(self):
         """在每次推理前调用，重置物理场追踪记录。"""
+        self._pinn_local_step = 0
         self.physics_tracking = {
-            "steps": [], "scale": [], "effective_scale": [],
+            "steps": [], "correction_applied": [],
+            "pinn_step_range": self.pinn_step_range,
+            "scale": [], "effective_scale": [],
             "raw_correction_norm": [], "gated_correction_norm": [], "correction_ratio": [],
             "div_before": [], "div_after": [],
             "vor_before": [], "vor_after": [],
@@ -1313,6 +1401,11 @@ class PhysicsInformedWanVideoPipeline(WanVideoPipeline):
                             t.get("div_after", []),
                             dtype=np.float32,
                         ),
+                        correction_applied_per_step=np.asarray(
+                            t.get("correction_applied", []),
+                            dtype=np.int8,
+                        ),
+                        pinn_step_range=np.asarray(str(t.get("pinn_step_range", ""))),
                         step_indices=np.asarray(t.get("steps", []), dtype=np.int32),
                     )
                     if expert_attribution_maps is not None:

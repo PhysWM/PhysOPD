@@ -30,9 +30,11 @@ CORE_ABLATION_MODES = (
     "generic_latent_correction",
     "wo_explicit_physical_interface",
     "wo_pde_residuals",
+    "wo_physical_mask",
     "wo_phenomenon_specific_operators",
     "wo_learned_expert_routing",
     "wo_physics_to_flow_injection",
+    "proxy_only_physical_state",
 )
 
 
@@ -1086,6 +1088,108 @@ class PhysicsAdapter(nn.Module):
             d[:, :, time_idx] = d[:, :, time_idx + 1] - dt * midpoint_velocity
         return d
 
+    @staticmethod
+    def _finite_difference_time(field):
+        if field.shape[2] <= 1:
+            return torch.zeros_like(field)
+        diff = field[:, :, 1:] - field[:, :, :-1]
+        return F.pad(diff, (0, 0, 0, 0, 0, 1))
+
+    def _proxy_channels(self, tensor, channels, start=0):
+        tensor = self._require_tensor(tensor, "proxy_source")
+        channels = int(channels)
+        start = max(int(start), 0)
+        if tensor.shape[1] >= start + channels:
+            return tensor[:, start:start + channels]
+        if tensor.shape[1] > start:
+            return self._repeat_channels(tensor[:, start:], channels)
+        return self._repeat_channels(tensor[:, :1], channels)
+
+    @staticmethod
+    def _normalize_proxy_field(field, clamp=3.0):
+        field = torch.nan_to_num(field.float(), nan=0.0, posinf=0.0, neginf=0.0)
+        dims = tuple(range(1, field.ndim))
+        mean = field.mean(dim=dims, keepdim=True)
+        std = field.std(dim=dims, keepdim=True, unbiased=False).clamp_min(1e-4)
+        field = (field - mean) / std
+        return torch.clamp(field, min=-float(clamp), max=float(clamp))
+
+    def build_deterministic_proxy_field_bank(self, v_original, state_for_physics, metadata=None):
+        del metadata
+        v_original = self._require_tensor(v_original, "proxy_v_original")
+        state_for_physics = self._require_tensor(
+            state_for_physics,
+            "proxy_state_for_physics",
+            expected_channels=self.latent_dim,
+        )
+        state_scalar = self._scalarize_field(state_for_physics)
+        state_grad_x = self._finite_difference_width(state_scalar)
+        state_grad_y = self._finite_difference_height(state_scalar)
+        texture_energy = torch.sqrt(state_grad_x.square() + state_grad_y.square() + 1e-6)
+
+        u_seed = self._proxy_channels(v_original, 2)
+        u = torch.tanh(self._normalize_proxy_field(u_seed))
+        kinematics = self._velocity_kinematics(u)
+        eps = torch.clamp(kinematics["eps"], min=-3.0, max=3.0)
+        d_phys = torch.clamp(self._integrate_displacement_from_velocity(u), min=-3.0, max=3.0)
+
+        motion_mag = torch.linalg.vector_norm(u, dim=1, keepdim=True)
+        temporal_u = self._finite_difference_time(u)
+        acceleration_mag = torch.linalg.vector_norm(temporal_u, dim=1, keepdim=True)
+        local_energy = self._normalize_proxy_field(
+            motion_mag + 0.25 * texture_energy,
+            clamp=3.0,
+        )
+
+        p_scalar = torch.tanh(self._normalize_proxy_field(-kinematics["div_u"], clamp=3.0))
+        rho_scalar = torch.clamp(F.softplus(0.5 * local_energy) + self.only_u_rho_floor, 1e-4, 5.0)
+        sigma = torch.clamp(self._build_sigma(p_scalar, eps), min=-5.0, max=5.0)
+
+        alpha_scalar = torch.sigmoid(self._normalize_proxy_field(motion_mag + texture_energy, clamp=3.0))
+        T_scalar = torch.tanh(self._normalize_proxy_field(acceleration_mag + texture_energy, clamp=3.0))
+        j_phys = torch.clamp(-temporal_u, min=-3.0, max=3.0)
+        damage_drive = acceleration_mag + eps.abs().mean(dim=1, keepdim=True)
+        D_scalar = torch.sigmoid(self._normalize_proxy_field(damage_drive, clamp=3.0))
+        psi_scalar = torch.tanh(self._normalize_proxy_field(kinematics["curl_u"] + texture_energy, clamp=3.0))
+
+        field_dict = {
+            "u": u,
+            "u_phys": u,
+            "p": self._repeat_channels(p_scalar, 2),
+            "p_scalar": p_scalar,
+            "rho": self._repeat_channels(rho_scalar, 2),
+            "rho_scalar": rho_scalar,
+            "eps": eps,
+            "sigma": sigma,
+            "d": self._repeat_channels(d_phys, 4),
+            "d_phys": d_phys,
+            "alpha": self._repeat_channels(alpha_scalar, 2),
+            "alpha_scalar": alpha_scalar,
+            "T": self._repeat_channels(T_scalar, 2),
+            "T_scalar": T_scalar,
+            "j": self._repeat_channels(j_phys, 4),
+            "j_phys": j_phys,
+            "D": self._repeat_channels(D_scalar, 2),
+            "D_scalar": D_scalar,
+            "psi": self._repeat_channels(psi_scalar, 2),
+            "psi_scalar": psi_scalar,
+            "div_u": kinematics["div_u"],
+            "curl_u": kinematics["curl_u"],
+        }
+        contract_field_dict = dict(field_dict)
+        contract_field_dict["u"] = self._repeat_channels(u, 4)
+        bank = self._pack_field_dict_to_bank(contract_field_dict, state_for_physics)
+        bank = self._safe_physical_tensor(bank.to(dtype=state_for_physics.dtype), "deterministic_proxy_bank")
+        metrics = {
+            "proxy_u_abs_mean": u.detach().abs().mean(),
+            "proxy_motion_mean": motion_mag.detach().mean(),
+            "proxy_rho_mean": rho_scalar.detach().mean(),
+            "proxy_T_abs_mean": T_scalar.detach().abs().mean(),
+            "proxy_alpha_mean": alpha_scalar.detach().mean(),
+            "proxy_damage_mean": D_scalar.detach().mean(),
+        }
+        return field_dict, bank, metrics
+
     def _accumulate_damage(self, damage_init, damage_drive, metadata=None, eta=0.2):
         damage_init = self._scalarize_field(damage_init).sigmoid()
         damage_drive = self._scalarize_field(damage_drive)
@@ -1349,10 +1453,24 @@ class PhysicsAdapter(nn.Module):
             "physics_feat_shared_post_sigma",
             expected_channels=self.hidden_dim,
         )
-        shared_attribute_bank = self._decode_attribute_bank(
+        learned_attribute_bank = self._decode_attribute_bank(
             physics_feat_shared,
             "shared_attribute_bank",
         )
+        proxy_only_physical_state = self.core_ablation_mode == "proxy_only_physical_state"
+        proxy_field_dict_live = None
+        proxy_field_metrics = {}
+        if proxy_only_physical_state:
+            proxy_field_dict_live, shared_attribute_bank, proxy_field_metrics = (
+                self.build_deterministic_proxy_field_bank(
+                    v_original,
+                    state_for_physics,
+                    metadata=metadata,
+                )
+            )
+            shared_attribute_bank = shared_attribute_bank.to(dtype=physics_feat_shared.dtype)
+        else:
+            shared_attribute_bank = learned_attribute_bank
         observable_fields, observable_outputs = self.predict_observable_proxies(shared_attribute_bank)
 
         self._cache = {
@@ -1647,10 +1765,24 @@ class PhysicsAdapter(nn.Module):
                 f"Strict physical-state contract forbids shared fallback because {reason}."
             )
 
-        shared_attribute_bank = self._decode_attribute_bank(
+        learned_attribute_bank = self._decode_attribute_bank(
             physics_feat_shared,
             "shared_attribute_bank",
         )
+        proxy_only_physical_state = self.core_ablation_mode == "proxy_only_physical_state"
+        proxy_field_dict_live = None
+        proxy_field_metrics = {}
+        if proxy_only_physical_state:
+            proxy_field_dict_live, shared_attribute_bank, proxy_field_metrics = (
+                self.build_deterministic_proxy_field_bank(
+                    v_original,
+                    state_for_physics,
+                    metadata=metadata,
+                )
+            )
+            shared_attribute_bank = shared_attribute_bank.to(dtype=physics_feat_shared.dtype)
+        else:
+            shared_attribute_bank = learned_attribute_bank
 
         cond_feat = torch.zeros(
             B,
@@ -1719,72 +1851,73 @@ class PhysicsAdapter(nn.Module):
                 dtype=state_for_physics.dtype,
             )
 
-            for sample_idx in range(B):
-                sample_input = operator_input[sample_idx:sample_idx + 1]
-                sample_input = self._require_tensor(sample_input, "sample_input")
-                self.set_debug_context(
-                    sample_index=sample_idx,
-                    selected_topk_experts=topk_indices[sample_idx].detach(),
-                    selected_topk_weights=topk_weights[sample_idx].detach(),
-                    active_label_ids=(
-                        active_label_ids[sample_idx].detach()
-                        if isinstance(active_label_ids, torch.Tensor)
-                        and active_label_ids.ndim >= 1
-                        and sample_idx < active_label_ids.shape[0]
-                        else None
-                    ),
-                    offlabel_selected_experts=(
-                        offlabel_selected_experts[sample_idx].detach()
-                        if isinstance(offlabel_selected_experts, torch.Tensor)
-                        and offlabel_selected_experts.ndim >= 1
-                        and sample_idx < offlabel_selected_experts.shape[0]
-                        else None
-                    ),
-                    dominant_expert=(
-                        int(dominant_expert[sample_idx].item())
-                        if isinstance(dominant_expert, torch.Tensor)
-                        and dominant_expert.ndim >= 1
-                        and sample_idx < dominant_expert.shape[0]
-                        else None
-                    ),
-                )
-                for slot_idx in range(topk_indices.shape[1]):
-                    expert_idx = int(topk_indices[sample_idx, slot_idx].item())
-                    expert_weight = topk_weights[sample_idx, slot_idx].to(
-                        device=sample_input.device,
-                        dtype=sample_input.dtype,
-                    )
+            if not proxy_only_physical_state:
+                for sample_idx in range(B):
+                    sample_input = operator_input[sample_idx:sample_idx + 1]
+                    sample_input = self._require_tensor(sample_input, "sample_input")
                     self.set_debug_context(
-                        expert_idx=expert_idx,
-                        expert_name=self.phenomenon_name_from_index(expert_idx),
+                        sample_index=sample_idx,
+                        selected_topk_experts=topk_indices[sample_idx].detach(),
+                        selected_topk_weights=topk_weights[sample_idx].detach(),
+                        active_label_ids=(
+                            active_label_ids[sample_idx].detach()
+                            if isinstance(active_label_ids, torch.Tensor)
+                            and active_label_ids.ndim >= 1
+                            and sample_idx < active_label_ids.shape[0]
+                            else None
+                        ),
+                        offlabel_selected_experts=(
+                            offlabel_selected_experts[sample_idx].detach()
+                            if isinstance(offlabel_selected_experts, torch.Tensor)
+                            and offlabel_selected_experts.ndim >= 1
+                            and sample_idx < offlabel_selected_experts.shape[0]
+                            else None
+                        ),
+                        dominant_expert=(
+                            int(dominant_expert[sample_idx].item())
+                            if isinstance(dominant_expert, torch.Tensor)
+                            and dominant_expert.ndim >= 1
+                            and sample_idx < dominant_expert.shape[0]
+                            else None
+                        ),
                     )
-                    operator_module_idx = (
-                        expert_idx
-                        if self.use_phenomenon_specific_operators
-                        else 0
-                    )
-                    operator_output = self.operator_experts[operator_module_idx](sample_input)
-                    operator_output = self._require_tensor(
-                        operator_output,
-                        f"branch_attribute_update_expert_{expert_idx}_source",
-                    )
-                    delta_attr = self._decode_operator_attribute_update(
-                        operator_output,
-                        expert_idx,
-                        f"branch_attribute_update_expert_{expert_idx}",
-                    )
-                    branch_attribute_updates[sample_idx:sample_idx + 1, slot_idx] = delta_attr.to(
-                        dtype=branch_attribute_updates.dtype
-                    )
-                    updated_fused_attribute_delta = (
-                        fused_attribute_delta[sample_idx:sample_idx + 1]
-                        + expert_weight.to(dtype=delta_attr.dtype) * delta_attr
-                    )
-                    updated_fused_attribute_delta = self._require_tensor(
-                        updated_fused_attribute_delta,
-                        "fused_attribute_delta_accumulated",
-                    )
-                    fused_attribute_delta[sample_idx:sample_idx + 1] = updated_fused_attribute_delta
+                    for slot_idx in range(topk_indices.shape[1]):
+                        expert_idx = int(topk_indices[sample_idx, slot_idx].item())
+                        expert_weight = topk_weights[sample_idx, slot_idx].to(
+                            device=sample_input.device,
+                            dtype=sample_input.dtype,
+                        )
+                        self.set_debug_context(
+                            expert_idx=expert_idx,
+                            expert_name=self.phenomenon_name_from_index(expert_idx),
+                        )
+                        operator_module_idx = (
+                            expert_idx
+                            if self.use_phenomenon_specific_operators
+                            else 0
+                        )
+                        operator_output = self.operator_experts[operator_module_idx](sample_input)
+                        operator_output = self._require_tensor(
+                            operator_output,
+                            f"branch_attribute_update_expert_{expert_idx}_source",
+                        )
+                        delta_attr = self._decode_operator_attribute_update(
+                            operator_output,
+                            expert_idx,
+                            f"branch_attribute_update_expert_{expert_idx}",
+                        )
+                        branch_attribute_updates[sample_idx:sample_idx + 1, slot_idx] = delta_attr.to(
+                            dtype=branch_attribute_updates.dtype
+                        )
+                        updated_fused_attribute_delta = (
+                            fused_attribute_delta[sample_idx:sample_idx + 1]
+                            + expert_weight.to(dtype=delta_attr.dtype) * delta_attr
+                        )
+                        updated_fused_attribute_delta = self._require_tensor(
+                            updated_fused_attribute_delta,
+                            "fused_attribute_delta_accumulated",
+                        )
+                        fused_attribute_delta[sample_idx:sample_idx + 1] = updated_fused_attribute_delta
 
             with torch.no_grad():
                 hist = torch.zeros(self.num_phenomena, device=v_original.device, dtype=torch.float32)
@@ -1824,6 +1957,9 @@ class PhysicsAdapter(nn.Module):
                 metadata=metadata,
                 field_recovery_phase=self.field_recovery_phase,
             )
+        elif proxy_only_physical_state:
+            physical_field_dict_live = proxy_field_dict_live
+            physical_field_metrics = proxy_field_metrics
         cond_map = cond_feat.view(B, self.hidden_dim, 1, 1, 1).expand(
             -1, -1, *physics_feat_shared.shape[2:]
         )
@@ -1866,6 +2002,11 @@ class PhysicsAdapter(nn.Module):
             "use_phenomenon_specific_operators": bool(self.use_phenomenon_specific_operators),
             "physics_to_flow_injection_enabled": bool(self.physics_to_flow_injection_enabled),
             "force_label_only_routing": bool(self.force_label_only_routing),
+            "proxy_only_physical_state": bool(proxy_only_physical_state),
+            "learned_physical_state_recovery": bool(not proxy_only_physical_state),
+            "proxy_field_bank_source": (
+                "deterministic_latent_proxy" if proxy_only_physical_state else None
+            ),
             "using_shared_fallback": using_shared_fallback,
             "fallback_reason": fallback_reason,
             "moe_top_k": int(self.moe_top_k),
@@ -1899,6 +2040,8 @@ class PhysicsAdapter(nn.Module):
             ),
             "shared_attribute_bank": shared_attribute_bank.detach(),
             "shared_attribute_bank_live": shared_attribute_bank,
+            "learned_attribute_bank": learned_attribute_bank.detach(),
+            "learned_attribute_bank_live": learned_attribute_bank,
             "fused_attribute_bank": fused_attribute_bank.detach(),
             "fused_attribute_bank_live": fused_attribute_bank,
             "physical_field_dict": {
@@ -2061,6 +2204,7 @@ class PhysicsAdapter(nn.Module):
         self.use_phenomenon_specific_operators = mode not in {
             "generic_latent_correction",
             "wo_phenomenon_specific_operators",
+            "proxy_only_physical_state",
         }
         self.physics_to_flow_injection_enabled = mode != "wo_physics_to_flow_injection"
         self.force_label_only_routing = mode == "wo_learned_expert_routing"

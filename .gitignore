@@ -28,6 +28,7 @@
 /tests/
 /phygenbench_hunyuan/
 /phygenbench_videos_wan22_pinn_batch/
+/phygenbench_videos_wan21_pinn_batch2/
 /phygenbench_router_wan21_step1/
 /diffsynth/__pycache__/
 /diffsynth/data/__pycache__/
@@ -35,3 +36,10 @@
 /phygenbench_moe_topk_ablation/
 /phygenbench_router_wan21_step1_full160/
 /phygenbench_router_wan21_step1_logits/
+/pinn_noise_step_ablation_50/
+/pinn_noise_step_ablation_50_llm_refine/
+/diffsynth/pipelines/__pycache__/
+/diffsynth/models/__pycache__/
+/output_videos_pinn_corrected2/
+/output_videos_wan21_pinn_batch2/
+/phygenbench_moe_topk_speed_benchmark/
