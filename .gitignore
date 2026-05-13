@@ -69,7 +69,7 @@
 /.vscode/
 /.github/
 /apps/
-/examples/CogvideoX/
+examples/CogvideoX
 examples/ControlNet
 /examples/HunyuanVideo/
 /examples/flux/
