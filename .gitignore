@@ -122,3 +122,6 @@
 /diffsynth/utils/__pycache__/
 /diffsynth/vram_management/__pycache__/
 /examples/wanvideo/pinn_inference/__pycache__/
+/docs/
+/scripts/
+/tools/
