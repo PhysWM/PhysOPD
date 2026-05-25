@@ -125,3 +125,5 @@
 /docs/
 /scripts/
 /tools/
+/outputs_new/
+/examples/wanvideo/pinn_training/__pycache__/
