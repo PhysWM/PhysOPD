@@ -25,14 +25,15 @@ import random
 import sys
 import time
 import types
+from datetime import timedelta
 from pathlib import Path
 
 import torch
-import torch.distributed as dist
 import torch.nn.functional as F
+from accelerate import Accelerator
+from accelerate.utils import DistributedDataParallelKwargs, InitProcessGroupKwargs
 from einops import rearrange
 from torch.utils.data import DataLoader, Dataset
-from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 
 
@@ -62,48 +63,6 @@ PHENOMENON_TO_RESIDUAL_METHOD = {
     "Optical": "optical_residual",
 }
 
-
-def distributed_is_initialized():
-    return dist.is_available() and dist.is_initialized()
-
-
-def get_rank():
-    return dist.get_rank() if distributed_is_initialized() else 0
-
-
-def get_world_size():
-    return dist.get_world_size() if distributed_is_initialized() else 1
-
-
-def is_main_process():
-    return get_rank() == 0
-
-
-def setup_distributed():
-    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-    world_size = int(os.environ.get("WORLD_SIZE", "1"))
-    if torch.cuda.is_available():
-        torch.cuda.set_device(local_rank)
-    if world_size > 1 and not distributed_is_initialized():
-        dist.init_process_group(backend="nccl", init_method="env://")
-    return local_rank, world_size
-
-
-def cleanup_distributed():
-    if distributed_is_initialized():
-        dist.barrier()
-        dist.destroy_process_group()
-
-
-def average_gradients(module):
-    if not distributed_is_initialized():
-        return
-    world_size = float(dist.get_world_size())
-    for param in module.parameters():
-        if param.grad is None:
-            continue
-        dist.all_reduce(param.grad, op=dist.ReduceOp.SUM)
-        param.grad.div_(world_size)
 
 FIELD_RECOVERY_PHASES = ("core", "alpha", "T", "j", "D", "psi")
 FIELD_RECOVERY_PHASE_TO_INDEX = {name: idx for idx, name in enumerate(FIELD_RECOVERY_PHASES)}
@@ -406,8 +365,6 @@ def collate_batch(items):
 
 
 def save_checkpoint(path, adapter, optimizer, step, args, contracts):
-    if not is_main_process():
-        return
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -872,6 +829,112 @@ def encoder_completion_loss(adapter, pde_residuals, state_for_physics, sigma, me
     return total, metrics
 
 
+class AnyFlowPINNTrainModule(torch.nn.Module):
+    def __init__(self, adapter, pde_residuals, phenomenon_labels, args):
+        super().__init__()
+        self.adapter = adapter
+        self.pde_residuals = pde_residuals
+        self.phenomenon_labels = list(phenomenon_labels)
+        self.args = args
+
+    def forward(self, velocity_bcthw, target_bcthw, state_for_physics, sigma, metadata, step_tensor):
+        step = int(step_tensor.detach().view(-1)[0].item())
+        args = self.args
+        configure_training_stage(self.adapter, args, current_step=step)
+
+        if args.training_stage == "observable_pretrain":
+            proxy_targets = build_observable_proxy_targets(state_for_physics)
+            stage_outputs = self.adapter.forward_observable_pretrain(
+                state_for_physics,
+                sigma=sigma,
+            )
+            loss, obs_errors = observable_alignment_terms(
+                stage_outputs["observable_outputs"],
+                proxy_targets,
+                proxy_targets["proxy_conf"],
+                args.observable_target_mode,
+            )
+            metrics = {
+                "loss": loss.detach(),
+                "pde_loss": state_for_physics.new_zeros(()),
+                "correction_loss": obs_errors["flow_error"].detach() + obs_errors["deformation_error"].detach(),
+                "fm_adapter_loss": state_for_physics.new_zeros(()),
+                "loss_obs": loss.detach(),
+                "obs_flow_error": obs_errors["flow_error"].detach(),
+                "obs_deformation_error": obs_errors["deformation_error"].detach(),
+                "proxy_conf": proxy_targets["proxy_conf"].detach().mean(),
+            }
+            return loss, metrics
+
+        if args.training_stage == "encoder_completion":
+            loss, stage_metrics = encoder_completion_loss(
+                self.adapter,
+                self.pde_residuals,
+                state_for_physics,
+                sigma,
+                metadata,
+                args,
+                step,
+            )
+            pde_loss = torch.as_tensor(
+                stage_metrics["encoder_completion_local_loss"],
+                device=state_for_physics.device,
+                dtype=state_for_physics.dtype,
+            )
+            metrics = {
+                "loss": loss.detach(),
+                "pde_loss": pde_loss.detach(),
+                "correction_loss": state_for_physics.new_zeros(()),
+                "fm_adapter_loss": state_for_physics.new_zeros(()),
+            }
+            for key, value in stage_metrics.items():
+                if isinstance(value, (int, float)):
+                    metrics[key] = torch.as_tensor(value, device=state_for_physics.device)
+            return loss, metrics
+
+        if args.ablate_disable_moe:
+            adapter_metadata = None
+        elif args.ablate_label_only_router:
+            adapter_metadata = label_only_metadata(metadata)
+        else:
+            adapter_metadata = metadata
+
+        corrected_velocity = self.adapter(
+            velocity_bcthw,
+            state_for_physics,
+            sigma=sigma,
+            metadata=adapter_metadata,
+        )
+        pde_loss, pde_info = compute_targeted_expert_pde_loss(
+            self.adapter,
+            self.pde_residuals,
+            metadata,
+            self.phenomenon_labels,
+            sigma,
+            args,
+            step,
+        )
+        correction_loss = torch.mean((corrected_velocity - velocity_bcthw) ** 2).clamp(0.0, 100.0)
+        fm_adapter_loss = F.mse_loss(corrected_velocity.float(), target_bcthw.float()).clamp(0.0, 100.0)
+        physics_weight = effective_physics_weight(args, step)
+        loss = fm_adapter_loss + physics_weight * pde_loss + args.correction_weight * correction_loss
+        metrics = {
+            "loss": loss.detach(),
+            "pde_loss": pde_loss.detach(),
+            "correction_loss": correction_loss.detach(),
+            "fm_adapter_loss": fm_adapter_loss.detach(),
+            "physics_weight_effective": torch.as_tensor(physics_weight, device=state_for_physics.device),
+            "sigma_threshold_effective": torch.as_tensor(
+                effective_sigma_threshold(args, step),
+                device=state_for_physics.device,
+            ),
+        }
+        for key, value in pde_info.items():
+            if isinstance(value, (int, float)):
+                metrics[f"physics_{key}"] = torch.as_tensor(value, device=state_for_physics.device)
+        return loss, metrics
+
+
 def make_adapter(args, contracts, operators, adapter_mod):
     pde_residuals = operators.MaterialPDEResiduals(
         num_phenomena=len(contracts.PHENOMENON_LABELS),
@@ -977,6 +1040,8 @@ def parse_args():
     parser.add_argument("--consistency_ratio", type=float, default=0.25)
     parser.add_argument("--min_sigma", type=float, default=0.02)
     parser.add_argument("--max_sigma", type=float, default=0.98)
+    parser.add_argument("--find_unused_parameters", action="store_true", default=True)
+    parser.add_argument("--ddp_timeout_seconds", type=int, default=3600)
     return parser.parse_args()
 
 
@@ -984,11 +1049,16 @@ def main():
     args = parse_args()
     if args.batch_size != 1:
         raise ValueError("Use --batch_size 1 and gradient accumulation for this script.")
-    local_rank, world_size = setup_distributed()
-    rank = get_rank()
-    random.seed(args.seed + rank)
-    torch.manual_seed(args.seed + rank)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    accelerator = Accelerator(
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        kwargs_handlers=[
+            DistributedDataParallelKwargs(find_unused_parameters=args.find_unused_parameters),
+            InitProcessGroupKwargs(timeout=timedelta(seconds=max(int(args.ddp_timeout_seconds), 1))),
+        ],
+    )
+    random.seed(args.seed + accelerator.process_index)
+    torch.manual_seed(args.seed + accelerator.process_index)
+    device = accelerator.device
     if device.type != "cuda":
         raise RuntimeError("AnyFlow 1.3B adapter training requires CUDA.")
 
@@ -1000,19 +1070,28 @@ def main():
     checkpoint_path = args.pinn_checkpoint or args.resume_checkpoint
     if checkpoint_path:
         result = load_adapter_checkpoint(checkpoint_path, adapter)
-        if is_main_process():
+        if accelerator.is_main_process:
             print(f"[resume] {checkpoint_path}: missing={result.missing_keys}, unexpected={result.unexpected_keys}")
     if args.training_stage in {"encoder_completion", "full_pinn"} and args.stage1_pretrained_encoder and not checkpoint_path:
         loaded = load_stage1_encoder_checkpoint(args.stage1_pretrained_encoder, adapter)
-        if is_main_process():
+        if accelerator.is_main_process:
             print(f"[stage1] loaded encoder scaffold from {args.stage1_pretrained_encoder}: {', '.join(loaded)}")
 
     adapter.to(device=device, dtype=torch.float32)
     pde_residuals.to(device=device, dtype=torch.float32)
     configure_training_stage(adapter, args, current_step=0)
+    train_model = AnyFlowPINNTrainModule(
+        adapter,
+        pde_residuals,
+        contracts.PHENOMENON_LABELS,
+        args,
+    )
 
-    if is_main_process():
-        print(f"[distributed] world_size={world_size}, rank={rank}, local_rank={local_rank}")
+    if accelerator.is_main_process:
+        print(
+            f"[distributed] world_size={accelerator.num_processes}, "
+            f"rank={accelerator.process_index}, local_rank={accelerator.local_process_index}"
+        )
         print(f"[load] AnyFlow pipeline: {args.anyflow_model_path}")
     pipe = WanAnyFlowPipeline.from_pretrained(args.anyflow_model_path, torch_dtype=torch.bfloat16)
     pipe.to(device)
@@ -1030,35 +1109,28 @@ def main():
         num_frames=args.num_frames,
         max_samples=args.max_samples,
     )
-    sampler = DistributedSampler(
-        dataset,
-        num_replicas=world_size,
-        rank=rank,
-        shuffle=True,
-        seed=args.seed,
-        drop_last=False,
-    ) if world_size > 1 else None
     loader = DataLoader(
         dataset,
         batch_size=1,
-        shuffle=(sampler is None),
-        sampler=sampler,
+        shuffle=True,
         num_workers=args.num_workers,
         pin_memory=True,
         collate_fn=collate_batch,
+        drop_last=True,
     )
 
     if not any(param.requires_grad for param in adapter.parameters()):
         raise RuntimeError(f"No trainable PhysicsAdapter parameters for stage={args.training_stage}")
     optimizer = torch.optim.AdamW(
-        adapter.parameters(),
+        train_model.parameters(),
         lr=args.learning_rate,
         weight_decay=args.weight_decay,
         betas=(0.9, 0.95),
     )
+    train_model, optimizer, loader = accelerator.prepare(train_model, optimizer, loader)
     output_path = Path(args.output_path)
     output_path.mkdir(parents=True, exist_ok=True)
-    if is_main_process():
+    if accelerator.is_main_process:
         with open(output_path / "training_config.json", "w", encoding="utf-8") as f:
             json.dump(vars(args), f, indent=2)
 
@@ -1066,16 +1138,13 @@ def main():
     running = {}
     start_time = time.time()
     optimizer.zero_grad(set_to_none=True)
-    progress = tqdm(total=args.max_steps, desc="anyflow-pinn") if is_main_process() else None
+    progress = tqdm(total=args.max_steps, desc="anyflow-pinn") if accelerator.is_local_main_process else None
     epoch = 0
 
     while global_step < args.max_steps:
-        if sampler is not None:
-            sampler.set_epoch(epoch)
         for batch in loader:
             if global_step >= args.max_steps:
                 break
-            configure_training_stage(adapter, args, current_step=global_step)
             videos = batch["pixel_values"].to(device=device, dtype=torch.float32, non_blocking=True)
             metadata = metadata_to_device(batch["metadata"], device)
 
@@ -1132,96 +1201,35 @@ def main():
                     dtype=state_for_physics.dtype,
                 )
             )
-
-            if args.training_stage == "observable_pretrain":
-                proxy_targets = build_observable_proxy_targets(state_for_physics)
-                stage_outputs = adapter.forward_observable_pretrain(
-                    state_for_physics,
-                    sigma=sigma_for_adapter,
-                )
-                loss, obs_errors = observable_alignment_terms(
-                    stage_outputs["observable_outputs"],
-                    proxy_targets,
-                    proxy_targets["proxy_conf"],
-                    args.observable_target_mode,
-                )
-                pde_loss = state_for_physics.new_zeros(())
-                correction_loss = obs_errors["flow_error"] + obs_errors["deformation_error"]
-                fm_adapter_loss = state_for_physics.new_zeros(())
-                stage_metrics = {
-                    "loss_obs": float(loss.detach().cpu()),
-                    "obs_flow_error": float(obs_errors["flow_error"].detach().cpu()),
-                    "obs_deformation_error": float(obs_errors["deformation_error"].detach().cpu()),
-                    "proxy_conf": float(proxy_targets["proxy_conf"].detach().mean().cpu()),
-                }
-            elif args.training_stage == "encoder_completion":
-                loss, stage_metrics = encoder_completion_loss(
-                    adapter,
-                    pde_residuals,
-                    state_for_physics,
-                    sigma_for_adapter,
-                    metadata,
-                    args,
-                    global_step,
-                )
-                pde_loss = torch.as_tensor(stage_metrics["encoder_completion_local_loss"], device=device, dtype=state_for_physics.dtype)
-                correction_loss = state_for_physics.new_zeros(())
-                fm_adapter_loss = state_for_physics.new_zeros(())
-            else:
-                if args.ablate_disable_moe:
-                    adapter_metadata = None
-                elif args.ablate_label_only_router:
-                    adapter_metadata = label_only_metadata(metadata)
-                else:
-                    adapter_metadata = metadata
-                corrected_velocity = adapter(
+            step_tensor = torch.tensor([global_step], device=device, dtype=torch.long)
+            with accelerator.accumulate(train_model):
+                optimizer.zero_grad()
+                loss, stage_metrics = train_model(
                     velocity_bcthw,
+                    target_bcthw,
                     state_for_physics,
-                    sigma=sigma_for_adapter,
-                    metadata=adapter_metadata,
-                )
-                pde_loss, pde_info = compute_targeted_expert_pde_loss(
-                    adapter,
-                    pde_residuals,
-                    metadata,
-                    contracts.PHENOMENON_LABELS,
                     sigma_for_adapter,
-                    args,
-                    global_step,
+                    metadata,
+                    step_tensor,
                 )
-                correction_loss = torch.mean((corrected_velocity - velocity_bcthw) ** 2).clamp(0.0, 100.0)
-                fm_adapter_loss = F.mse_loss(corrected_velocity.float(), target_bcthw.float()).clamp(0.0, 100.0)
-                physics_weight = effective_physics_weight(args, global_step)
-                loss = fm_adapter_loss + physics_weight * pde_loss + args.correction_weight * correction_loss
-                stage_metrics = {
-                    "loss_fm_adapter": float(fm_adapter_loss.detach().cpu()),
-                    "physics_weight_effective": physics_weight,
-                    "sigma_threshold_effective": effective_sigma_threshold(args, global_step),
-                    **{
-                        f"physics_{k}": v
-                        for k, v in pde_info.items()
-                        if isinstance(v, (int, float, str))
-                    },
-                }
-            loss = loss / max(1, args.gradient_accumulation_steps)
-            loss.backward()
-
-            if (global_step + 1) % args.gradient_accumulation_steps == 0:
-                average_gradients(adapter)
-                torch.nn.utils.clip_grad_norm_(adapter.parameters(), 1.0)
+                accelerator.backward(loss)
+                accelerator.clip_grad_norm_(train_model.parameters(), 1.0)
                 optimizer.step()
-                optimizer.zero_grad(set_to_none=True)
 
             raw = {
-                "loss": float(loss.detach().cpu()) * max(1, args.gradient_accumulation_steps),
-                "pde_loss": float(pde_loss.detach().cpu()),
-                "correction_loss": float(correction_loss.detach().cpu()),
-                "fm_adapter_loss": float(fm_adapter_loss.detach().cpu()),
+                "loss": float(stage_metrics["loss"].detach().float().cpu()),
+                "pde_loss": float(stage_metrics["pde_loss"].detach().float().cpu()),
+                "correction_loss": float(stage_metrics["correction_loss"].detach().float().cpu()),
+                "fm_adapter_loss": float(stage_metrics["fm_adapter_loss"].detach().float().cpu()),
                 "sigma": float(t_sigma.detach().cpu()[0]),
                 "label": metadata.get("label_name", ""),
                 "stage": args.training_stage,
             }
-            raw.update(stage_metrics)
+            for key, value in stage_metrics.items():
+                if key in raw:
+                    continue
+                if isinstance(value, torch.Tensor) and value.numel() == 1:
+                    raw[key] = float(value.detach().float().cpu())
             for key, value in raw.items():
                 if isinstance(value, (int, float)) and math.isfinite(float(value)):
                     running[key] = running.get(key, 0.95 * float(value)) * 0.95 + 0.05 * float(value)
@@ -1229,7 +1237,7 @@ def main():
             global_step += 1
             if progress is not None:
                 progress.update(1)
-            if is_main_process() and global_step % args.log_steps == 0:
+            if accelerator.is_main_process and global_step % args.log_steps == 0:
                 elapsed = max(time.time() - start_time, 1e-6)
                 msg = {
                     "step": global_step,
@@ -1242,10 +1250,11 @@ def main():
                     "samples_per_sec": global_step / elapsed,
                 }
                 print("[train] " + json.dumps(msg, ensure_ascii=False), flush=True)
-            if is_main_process() and global_step % args.save_steps == 0:
+            if accelerator.is_main_process and global_step % args.save_steps == 0:
+                unwrapped = accelerator.unwrap_model(train_model)
                 save_checkpoint(
                     output_path / f"step-{global_step}.pt",
-                    adapter,
+                    unwrapped.adapter,
                     optimizer,
                     global_step,
                     args,
@@ -1255,12 +1264,14 @@ def main():
                     json.dump(metadata_to_jsonable(metadata), f, ensure_ascii=False, indent=2)
         epoch += 1
 
-    save_checkpoint(output_path / "final.pt", adapter, optimizer, global_step, args, contracts)
+    accelerator.wait_for_everyone()
+    if accelerator.is_main_process:
+        unwrapped = accelerator.unwrap_model(train_model)
+        save_checkpoint(output_path / "final.pt", unwrapped.adapter, optimizer, global_step, args, contracts)
     if progress is not None:
         progress.close()
-    if is_main_process():
+    if accelerator.is_main_process:
         print(f"[done] saved final checkpoint to {output_path / 'final.pt'}")
-    cleanup_distributed()
 
 
 if __name__ == "__main__":

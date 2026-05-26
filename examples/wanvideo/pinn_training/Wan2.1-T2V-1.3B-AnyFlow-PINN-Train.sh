@@ -6,6 +6,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../../.." && pwd)"
+ACCELERATE_CONFIG_PATH="${ACCELERATE_CONFIG_PATH:-${SCRIPT_DIR}/accelerate_config_anyflow_pinn.yaml}"
 PYTHON_BIN="${PYTHON_BIN:-/home/dataset-assist-0/algorithm/cong.wang/miniconda3/envs/anyflow/bin/python}"
 
 cd "${REPO_ROOT}"
@@ -17,6 +18,7 @@ fi
 IFS=',' read -r -a GPU_IDS <<< "${CUDA_VISIBLE_DEVICES}"
 NUM_PROCESSES="${NUM_PROCESSES:-${#GPU_IDS[@]}}"
 MAIN_PROCESS_PORT="${MAIN_PROCESS_PORT:-29531}"
+MAIN_PROCESS_IP="${MAIN_PROCESS_IP:-127.0.0.1}"
 
 export TOKENIZERS_PARALLELISM=false
 export PYTHONPATH="${REPO_ROOT}:/home/dataset-assist-0/algorithm/cong.wang/try/AnyFlow${PYTHONPATH:+:${PYTHONPATH}}"
@@ -47,10 +49,13 @@ ENCODER_FREEZE_STEPS="${ENCODER_FREEZE_STEPS:-1000}"
 CORE_ABLATION_MODE="${CORE_ABLATION_MODE:-full}"
 
 TRAIN_CMD=(
-  "${PYTHON_BIN}" -m torch.distributed.run
-  --nnodes 1
-  --nproc_per_node "${NUM_PROCESSES}"
-  --master_port "${MAIN_PROCESS_PORT}"
+  "${PYTHON_BIN}" -m accelerate.commands.launch
+  --config_file "${ACCELERATE_CONFIG_PATH}"
+  --num_processes "${NUM_PROCESSES}"
+  --num_machines 1
+  --machine_rank 0
+  --main_process_ip "${MAIN_PROCESS_IP}"
+  --main_process_port "${MAIN_PROCESS_PORT}"
   "${SCRIPT_DIR}/train_anyflow_pinn.py"
   --pila_root "${REPO_ROOT}" \
   --anyflow_root "/home/dataset-assist-0/algorithm/cong.wang/try/AnyFlow" \
@@ -84,7 +89,9 @@ TRAIN_CMD=(
   --expert_pde_sigma_threshold "${EXPERT_PDE_SIGMA_THRESHOLD}" \
   --expert_pde_sigma_threshold_target "${EXPERT_PDE_SIGMA_THRESHOLD_TARGET}" \
   --correction_weight "${CORRECTION_WEIGHT}" \
-  --output_path "${OUTPUT_PATH}"
+  --output_path "${OUTPUT_PATH}" \
+  --find_unused_parameters \
+  --ddp_timeout_seconds "${DDP_TIMEOUT_SECONDS:-3600}"
 )
 
 if [[ -n "${MAX_SAMPLES:-}" ]]; then
