@@ -708,6 +708,46 @@ def compute_pde_loss(adapter, pde_residuals, metadata):
     return torch.clamp(loss.float(), 0.0, 100.0), dict(info)
 
 
+def build_encoder_completion_physical_mask(final_bank, metadata):
+    if not isinstance(final_bank, torch.Tensor) or final_bank.ndim != 5:
+        raise ValueError("encoder_completion physical mask requires [B, C, T, H, W] bank.")
+    return torch.ones(
+        final_bank.shape[0],
+        1,
+        final_bank.shape[2],
+        final_bank.shape[3],
+        final_bank.shape[4],
+        device=final_bank.device,
+        dtype=final_bank.dtype,
+    )
+
+
+def only_u_momentum_residual_vector(pde, u, p, rho, metadata=None):
+    u = u[:, :2]
+    ux = u[:, 0:1]
+    uy = u[:, 1:2]
+    p_scalar = p.mean(dim=1, keepdim=True)
+    rho_scalar = rho.mean(dim=1, keepdim=True).clamp_min(1e-4)
+    dux_dx = pde._grad_width(ux)
+    dux_dy = pde._grad_height(ux)
+    duy_dx = pde._grad_width(uy)
+    duy_dy = pde._grad_height(uy)
+    u_t = pde._temporal_derivative(u, metadata=metadata, order=1)
+    conv_x = ux * dux_dx + uy * dux_dy
+    conv_y = ux * duy_dx + uy * duy_dy
+    grad_px = pde._grad_width(p_scalar)
+    grad_py = pde._grad_height(p_scalar)
+    lap_u = pde._laplacian_field(u, metadata=metadata)
+    viscosity = 1e-3
+    return torch.cat(
+        [
+            u_t[:, 0:1] + conv_x + grad_px / rho_scalar - viscosity * lap_u[:, 0:1],
+            u_t[:, 1:2] + conv_y + grad_py / rho_scalar - viscosity * lap_u[:, 1:2],
+        ],
+        dim=1,
+    )
+
+
 def effective_physics_weight(args, step):
     target = args.physics_weight if args.physics_weight_target is None else args.physics_weight_target
     if args.physics_warmup_steps <= 0:
@@ -795,34 +835,177 @@ def encoder_completion_loss(adapter, pde_residuals, state_for_physics, sigma, me
     cache["fused_attribute_bank_live"] = final_bank
     cache["fused_attribute_bank"] = final_bank.detach()
     pde = pde_residuals
-    only_u_terms = pde._only_u_fluid_terms(field_dict["u"], field_dict["p"], field_dict["rho"], metadata=metadata)
-    local = (
-        only_u_terms["mass_residual"]
-        + only_u_terms["momentum_residual"]
-        + 0.25 * only_u_terms["pressure_smoothness"]
-        + 0.25 * (only_u_terms["density_smoothness"] + only_u_terms["density_floor"])
-    )
-    if "d_phys" in field_dict:
-        local = local + 0.5 * pde._temporal_alignment_loss(field_dict["d_phys"], field_dict["u"], metadata=metadata)
-    if phase_at_least(args, step, "alpha"):
-        alpha = field_dict["alpha_scalar"]
-        local = local + encoder_completion_loss_weight(args, step, "alpha") * (
-            0.1 * pde._spatial_gradient_energy(alpha, metadata=metadata)
-            + 0.1 * pde._weighted_square_mean(torch.relu(-alpha) + torch.relu(alpha - 1.0), metadata=metadata, ref_tensor=alpha)
-        )
-    if phase_at_least(args, step, "T"):
-        temp = field_dict["T_scalar"]
-        local = local + encoder_completion_loss_weight(args, step, "T") * (
-            0.1 * pde._spatial_gradient_energy(temp, metadata=metadata)
-        )
-    total = local + 0.1 * loss_obs_raw
     metrics = {
         "loss_obs": float(loss_obs_raw.detach().item()),
         "obs_flow_error": float(obs_errors["flow_error"].detach().item()),
         "obs_deformation_error": float(obs_errors["deformation_error"].detach().item()),
-        "encoder_completion_local_loss": float(local.detach().item()),
         "active_field_recovery_phase": phase,
     }
+    only_u_terms = pde._only_u_fluid_terms(field_dict["u"], field_dict["p"], field_dict["rho"], metadata=metadata)
+    d_phys = field_dict["d_phys"]
+    if d_phys.shape[2] > 1:
+        time_grid = metadata.get("frame_time_grid") if isinstance(metadata, dict) else None
+        if not isinstance(time_grid, torch.Tensor) or time_grid.shape[-1] != d_phys.shape[2]:
+            time_grid = torch.linspace(
+                0.0,
+                1.0,
+                steps=d_phys.shape[2],
+                device=d_phys.device,
+                dtype=d_phys.dtype,
+            ).unsqueeze(0).repeat(d_phys.shape[0], 1)
+        else:
+            time_grid = time_grid.to(device=d_phys.device, dtype=d_phys.dtype)
+        dt = (time_grid[:, 1:] - time_grid[:, :-1]).view(d_phys.shape[0], 1, d_phys.shape[2] - 1, 1, 1)
+        d_step = d_phys[:, :, 1:] - d_phys[:, :, :-1]
+        u_mid = 0.5 * (field_dict["u"][:, :, 1:] + field_dict["u"][:, :, :-1])
+        loss_d_integral = torch.mean((d_step - dt * u_mid) ** 2)
+    else:
+        loss_d_integral = pde._zero_loss(d_phys)
+    loss_d_kinematic = pde._temporal_alignment_loss(d_phys, field_dict["u"], metadata=metadata)
+
+    objectives = {}
+    objectives["core"] = (
+        only_u_terms["mass_residual"]
+        + only_u_terms["momentum_residual"]
+        + 0.25 * only_u_terms["pressure_smoothness"]
+        + 0.25 * (only_u_terms["density_smoothness"] + only_u_terms["density_floor"])
+        + 0.5 * loss_d_integral
+        + 0.5 * loss_d_kinematic
+    )
+    metrics.update({
+        "mass_residual": float(only_u_terms["mass_residual"].detach().item()),
+        "momentum_residual": float(only_u_terms["momentum_residual"].detach().item()),
+        "pressure_smoothness": float(only_u_terms["pressure_smoothness"].detach().item()),
+        "density_smoothness": float(only_u_terms["density_smoothness"].detach().item()),
+        "density_floor": float(only_u_terms["density_floor"].detach().item()),
+        "rho_mean": float(only_u_terms["rho_scalar"].detach().mean().item()),
+        "rho_min": float(only_u_terms["rho_scalar"].detach().min().item()),
+        "p_abs_mean": float(only_u_terms["p_scalar"].detach().abs().mean().item()),
+        "div_u_abs_mean": float(only_u_terms["div_u"].detach().abs().mean().item()),
+        "d_alignment_error": float(loss_d_kinematic.detach().item()),
+        "d_integral_consistency": float(loss_d_integral.detach().item()),
+    })
+    if phase_at_least(args, step, "alpha"):
+        alpha_scalar = field_dict["alpha_scalar"]
+        alpha_t = pde._temporal_derivative(alpha_scalar, metadata=metadata, order=1)
+        alpha_adv = (
+            field_dict["u"][:, 0:1] * pde._grad_width(alpha_scalar)
+            + field_dict["u"][:, 1:2] * pde._grad_height(alpha_scalar)
+        )
+        alpha_lap = pde._laplacian_field(alpha_scalar, metadata=metadata)
+        loss_alpha_transport = pde._weighted_square_mean(
+            alpha_t + alpha_adv - 1e-3 * alpha_lap,
+            metadata=metadata,
+            ref_tensor=alpha_scalar,
+        )
+        loss_alpha_range = pde._weighted_square_mean(
+            torch.relu(-alpha_scalar) + torch.relu(alpha_scalar - 1.0),
+            metadata=metadata,
+            ref_tensor=alpha_scalar,
+        )
+        loss_alpha_smooth = pde._spatial_gradient_energy(alpha_scalar, metadata=metadata)
+        objectives["alpha"] = loss_alpha_transport + 0.1 * loss_alpha_range + 0.1 * loss_alpha_smooth
+        metrics.update({
+            "alpha_mean": float(alpha_scalar.detach().mean().item()),
+            "alpha_transport_residual": float(loss_alpha_transport.detach().item()),
+            "alpha_range": float(loss_alpha_range.detach().item()),
+            "alpha_smooth": float(loss_alpha_smooth.detach().item()),
+        })
+    if phase_at_least(args, step, "T"):
+        temperature = field_dict["T_scalar"]
+        temp_t = pde._temporal_derivative(temperature, metadata=metadata, order=1)
+        temp_adv = (
+            field_dict["u"][:, 0:1] * pde._grad_width(temperature)
+            + field_dict["u"][:, 1:2] * pde._grad_height(temperature)
+        )
+        temp_lap = pde._laplacian_field(temperature, metadata=metadata)
+        loss_T_transport = pde._weighted_square_mean(
+            temp_t + temp_adv - 1e-3 * temp_lap,
+            metadata=metadata,
+            ref_tensor=temperature,
+        )
+        loss_T_smooth = pde._spatial_gradient_energy(temperature, metadata=metadata)
+        objectives["T"] = loss_T_transport + 0.1 * loss_T_smooth
+        metrics.update({
+            "T_mean": float(temperature.detach().mean().item()),
+            "T_transport_residual": float(loss_T_transport.detach().item()),
+            "T_smooth": float(loss_T_smooth.detach().item()),
+        })
+    if phase_at_least(args, step, "j"):
+        j_phys = field_dict["j_phys"]
+        momentum_residual_vector = only_u_momentum_residual_vector(
+            pde,
+            field_dict["u"],
+            field_dict["p"],
+            field_dict["rho"],
+            metadata=metadata,
+        ).detach()
+        physical_mask = build_encoder_completion_physical_mask(final_bank, metadata)
+        mask = physical_mask.to(device=j_phys.device, dtype=j_phys.dtype)
+        loss_j_contact = pde._weighted_square_mean(
+            mask * (j_phys + momentum_residual_vector),
+            metadata=metadata,
+            ref_tensor=j_phys,
+        )
+        loss_j_sparse = pde._weighted_square_mean(
+            (1.0 - mask) * j_phys,
+            metadata=metadata,
+            ref_tensor=j_phys,
+        )
+        objectives["j"] = loss_j_contact + 0.1 * loss_j_sparse
+        metrics.update({
+            "j_mask_mean": float(mask.detach().mean().item()),
+            "j_residual_fit": float(loss_j_contact.detach().item()),
+        })
+    if phase_at_least(args, step, "D"):
+        damage = field_dict["D_scalar"]
+        damage_drive = torch.relu(
+            torch.linalg.vector_norm(field_dict["j_phys"], dim=1, keepdim=True)
+            + field_dict["eps"].abs().mean(dim=1, keepdim=True)
+            - 0.1
+        )
+        loss_D_accumulate = pde._weighted_square_mean(
+            pde._temporal_derivative(damage, metadata=metadata, order=1) - damage_drive,
+            metadata=metadata,
+            ref_tensor=damage,
+        )
+        if damage.shape[2] > 1:
+            monotonic_violation = torch.relu(damage[:, :, :-1] - damage[:, :, 1:])
+            loss_D_monotonic = torch.mean(monotonic_violation ** 2)
+        else:
+            monotonic_violation = damage * 0.0
+            loss_D_monotonic = pde._zero_loss(damage)
+        loss_D_range = pde._weighted_square_mean(
+            torch.relu(-damage) + torch.relu(damage - 1.0),
+            metadata=metadata,
+            ref_tensor=damage,
+        )
+        objectives["D"] = loss_D_accumulate + 0.25 * loss_D_monotonic + 0.1 * loss_D_range
+        metrics.update({
+            "D_mean": float(damage.detach().mean().item()),
+            "D_monotonic_violation": float(monotonic_violation.detach().mean().item()),
+            "D_accumulate": float(loss_D_accumulate.detach().item()),
+        })
+    if phase_at_least(args, step, "psi"):
+        psi = field_dict["psi_scalar"]
+        alpha_ref = field_dict["alpha_scalar"]
+        loss_psi_wave = pde._wave_equation_loss(psi, metadata=metadata)
+        loss_psi_interference = pde._field_match_loss(psi, alpha_ref, metadata=metadata)
+        loss_psi_smooth = pde._spatial_gradient_energy(psi, metadata=metadata)
+        objectives["psi"] = loss_psi_wave + 0.2 * loss_psi_interference + 0.1 * loss_psi_smooth
+        metrics.update({
+            "psi_mean": float(psi.detach().mean().item()),
+            "psi_wave_residual": float(loss_psi_wave.detach().item()),
+        })
+
+    local = pde._zero_loss(final_bank)
+    for owner_phase, objective in objectives.items():
+        objective_weight = encoder_completion_loss_weight(args, step, owner_phase)
+        local = local + objective_weight * objective
+        metrics[f"{owner_phase}_objective"] = float(objective.detach().item())
+        metrics[f"{owner_phase}_objective_weight"] = float(objective_weight)
+    total = local + 0.1 * loss_obs_raw
+    metrics["encoder_completion_local_loss"] = float(local.detach().item())
     for key, value in field_metrics.items():
         if torch.is_tensor(value):
             metrics[key] = float(value.detach().float().mean().item())
@@ -1249,6 +1432,24 @@ def main():
                     "stage": args.training_stage,
                     "samples_per_sec": global_step / elapsed,
                 }
+                if args.training_stage == "encoder_completion":
+                    for key in (
+                        "encoder_completion_local_loss",
+                        "core_objective",
+                        "core_objective_weight",
+                        "mass_residual",
+                        "momentum_residual",
+                        "pressure_smoothness",
+                        "density_floor",
+                        "rho_min",
+                        "div_u_abs_mean",
+                        "d_alignment_error",
+                        "d_integral_consistency",
+                        "alpha_transport_residual",
+                        "T_transport_residual",
+                    ):
+                        if key in running:
+                            msg[f"{key}_ema"] = running[key]
                 print("[train] " + json.dumps(msg, ensure_ascii=False), flush=True)
             if accelerator.is_main_process and global_step % args.save_steps == 0:
                 unwrapped = accelerator.unwrap_model(train_model)

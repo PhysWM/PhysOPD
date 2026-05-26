@@ -1,6 +1,13 @@
 #!/bin/bash
-# Train PILA PhysicsAdapter with the same staged recipe as Wan2.1-T2V-1.3B-PINN-2Stage.sh,
-# but replace the frozen DiffSynth Wan backbone with AnyFlow-Wan2.1-T2V-1.3B.
+# Single-stage launcher for the AnyFlow backbone version of PILA training.
+#
+# The complete staged recipe is:
+#   1. observable_pretrain
+#   2. encoder_completion, initialized from observable_pretrain checkpoint
+#   3. full_pinn, initialized from encoder_completion checkpoint
+#
+# Use Wan2.1-T2V-1.3B-AnyFlow-PINN-3Stage.sh to run the full chain.
+# This file remains useful when rerunning or resuming one specific stage.
 
 set -euo pipefail
 
